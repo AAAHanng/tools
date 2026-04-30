@@ -1,0 +1,28 @@
+.bubble-root {
+  all: initial;
+  position: fixed;
+  z-index: 2147483646;
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border: none;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #101828, #2563eb);
+  color: #f8fafc;
+  box-shadow: 0 16px 36px rgba(15, 23, 42, 0.28);
+  cursor: grab;
+  user-select: none;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.bubble-root:hover {
+  transform: translateY(-1px) scale(1.02);
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.32);
+}
+
+.bubble-root:active {
+  cursor: grabbing;
+  transform: scale(0.98);
+}
+
