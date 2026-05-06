@@ -20,7 +20,12 @@ type JsonFlowNodeData = Record<string, unknown> & {
   kind: "object" | "array" | "value" | "stringified object" | "stringified array";
   preview: string;
   count?: number;
+  path: JsonPath;
+  onSelectPath?: (path: JsonPath) => void;
 };
+
+type JsonPathSegment = string | number;
+type JsonPath = JsonPathSegment[];
 
 type StringifiedJsonDescriptor = {
   value: Record<string, unknown> | unknown[];
@@ -97,7 +102,11 @@ function getFlowPreview(value: unknown) {
 
 function JsonFlowNode({ data }: NodeProps<Node<JsonFlowNodeData>>) {
   return (
-    <div className="json-flow-node">
+    <button
+      className="json-flow-node"
+      onClick={() => data.onSelectPath?.(data.path)}
+      type="button"
+    >
       <Handle type="target" position={Position.Left} className="json-flow-handle" />
       <div className="json-flow-node-head">
         <strong>{data.label}</strong>
@@ -108,7 +117,7 @@ function JsonFlowNode({ data }: NodeProps<Node<JsonFlowNodeData>>) {
         <div className="json-flow-node-count">{getItemCountText(data.count)}</div>
       ) : null}
       <Handle type="source" position={Position.Right} className="json-flow-handle" />
-    </div>
+    </button>
   );
 }
 
@@ -116,7 +125,7 @@ const jsonFlowNodeTypes = {
   jsonNode: JsonFlowNode
 };
 
-function buildJsonFlow(value: unknown) {
+function buildJsonFlow(value: unknown, onSelectPath?: (path: JsonPath) => void) {
   const nodes: Array<Node<JsonFlowNodeData>> = [];
   const edges: Edge[] = [];
   const levelCounts = new Map<number, number>();
@@ -126,6 +135,7 @@ function buildJsonFlow(value: unknown) {
     currentValue: unknown,
     label: string,
     depth: number,
+    path: JsonPath,
     parentId?: string
   ) => {
     if (nodeCount >= FLOW_MAX_NODES) {
@@ -168,7 +178,9 @@ function buildJsonFlow(value: unknown) {
         label,
         kind,
         preview: getFlowPreview(resolvedValue),
-        count: entries.length || undefined
+        count: entries.length || undefined,
+        path,
+        onSelectPath
       }
     });
 
@@ -185,11 +197,17 @@ function buildJsonFlow(value: unknown) {
     }
 
     for (const [entryLabel, entryValue] of entries) {
-      visit(entryValue, isArray ? `item ${entryLabel}` : entryLabel, depth + 1, id);
+      visit(
+        entryValue,
+        isArray ? `item ${entryLabel}` : entryLabel,
+        depth + 1,
+        [...path, isArray ? Number(entryLabel) : entryLabel],
+        id
+      );
     }
   };
 
-  visit(value, "root", 0);
+  visit(value, "root", 0, []);
 
   return {
     nodes,
@@ -198,8 +216,14 @@ function buildJsonFlow(value: unknown) {
   };
 }
 
-export default function JsonFlowViewer({ value }: { value: unknown }) {
-  const flow = React.useMemo(() => buildJsonFlow(value), [value]);
+export default function JsonFlowViewer({
+  value,
+  onSelectPath
+}: {
+  value: unknown;
+  onSelectPath?: (path: JsonPath) => void;
+}) {
+  const flow = React.useMemo(() => buildJsonFlow(value, onSelectPath), [onSelectPath, value]);
   const [nodes, setNodes, onNodesChange] = useNodesState(flow.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(flow.edges);
 

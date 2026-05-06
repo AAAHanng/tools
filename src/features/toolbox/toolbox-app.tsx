@@ -1,7 +1,16 @@
 import * as Tabs from "@radix-ui/react-tabs";
 import clsx from "clsx";
 import React from "react";
-import { CodeXml, FileJson2, FlaskConical, Globe, SearchCode, Wifi } from "lucide-react";
+import {
+  CodeXml,
+  FileJson2,
+  FlaskConical,
+  Globe,
+  Maximize2,
+  Minimize2,
+  SearchCode,
+  Wifi
+} from "lucide-react";
 
 import { JsonDiffTool } from "@/features/tools/json-diff-tool";
 import { JsonFormatTool } from "@/features/tools/json-format-tool";
@@ -70,37 +79,42 @@ function ReadyToolPanel(props: {
   tool: ToolDefinition;
   sourceTabId?: number;
   sourceHost?: string;
+  inputId?: string;
 }) {
-  const { tool, sourceTabId, sourceHost } = props;
+  const { tool, sourceTabId, sourceHost, inputId } = props;
 
   if (tool.id === "url-params") {
     return <UrlParamsTool sourceTabId={sourceTabId} sourceHost={sourceHost} />;
   }
 
   if (tool.id === "json-format") {
-    return <JsonFormatTool />;
+    return <JsonFormatTool inputId={inputId} />;
   }
 
   if (tool.id === "json-diff") {
-    return <JsonDiffTool />;
+    return <JsonDiffTool inputId={inputId} />;
   }
 
   return <PlannedToolPlaceholder tool={tool} />;
 }
 
 export function ToolboxApp() {
+  const shellRef = React.useRef<HTMLElement | null>(null);
+  const fallbackFullscreenRef = React.useRef(false);
   const params = new URLSearchParams(window.location.search);
   const toolFromQuery = params.get("tool") ?? "json-format";
   const sourceHost = params.get("sourceHost") ?? undefined;
   const sourceTabId = params.get("sourceTabId")
     ? Number(params.get("sourceTabId"))
     : undefined;
+  const inputId = params.get("inputId") ?? undefined;
 
   const initialTool = findToolById(toolFromQuery) ?? findToolById("json-format")!;
   const [selectedCategory, setSelectedCategory] = React.useState<ToolCategory>(
     initialTool.category
   );
   const [selectedToolId, setSelectedToolId] = React.useState(initialTool.id);
+  const [isPageFullscreen, setIsPageFullscreen] = React.useState(false);
 
   const categoryTools = React.useMemo(
     () => ALL_TOOLS.filter((tool) => tool.category === selectedCategory),
@@ -137,13 +151,75 @@ export function ToolboxApp() {
     );
   }, [selectedToolId]);
 
+  React.useEffect(() => {
+    const handleFullscreenChange = () => {
+      if (document.fullscreenElement === shellRef.current) {
+        fallbackFullscreenRef.current = false;
+        setIsPageFullscreen(true);
+        return;
+      }
+
+      if (!fallbackFullscreenRef.current) {
+        setIsPageFullscreen(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !fallbackFullscreenRef.current) {
+        return;
+      }
+
+      fallbackFullscreenRef.current = false;
+      setIsPageFullscreen(false);
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  const togglePageFullscreen = async () => {
+    if (isPageFullscreen) {
+      fallbackFullscreenRef.current = false;
+      setIsPageFullscreen(false);
+
+      if (document.fullscreenElement) {
+        await document.exitFullscreen().catch(() => undefined);
+      }
+
+      return;
+    }
+
+    const shell = shellRef.current;
+
+    if (!shell) {
+      return;
+    }
+
+    try {
+      await shell.requestFullscreen();
+      fallbackFullscreenRef.current = false;
+      setIsPageFullscreen(true);
+    } catch {
+      fallbackFullscreenRef.current = true;
+      setIsPageFullscreen(true);
+    }
+  };
+
   const selectedTool =
     findToolById(selectedToolId) ??
     categoryTools.find((tool) => tool.status === "ready") ??
     categoryTools[0];
 
   return (
-    <main className="toolbox-shell">
+    <main
+      ref={shellRef}
+      className={clsx("toolbox-shell", isPageFullscreen && "is-page-fullscreen")}
+    >
       <Tabs.Root
         value={selectedCategory}
         onValueChange={(value) => setSelectedCategory(value as ToolCategory)}
@@ -178,7 +254,18 @@ export function ToolboxApp() {
             {tool.name}
           </button>
         ))}
-        {sourceHost ? <span className="meta-pill host-pill">{sourceHost}</span> : null}
+        <div className="toolbox-page-actions">
+          {sourceHost ? <span className="meta-pill">{sourceHost}</span> : null}
+          <button
+            className={clsx("mini-switch icon-text-switch", isPageFullscreen && "is-active")}
+            onClick={togglePageFullscreen}
+            type="button"
+            title={isPageFullscreen ? "退出全屏" : "全屏"}
+          >
+            {isPageFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+            <span>{isPageFullscreen ? "退出全屏" : "全屏"}</span>
+          </button>
+        </div>
       </div>
 
       <section className="workspace-stage compact-stage">
@@ -188,6 +275,7 @@ export function ToolboxApp() {
               tool={selectedTool}
               sourceTabId={sourceTabId}
               sourceHost={sourceHost}
+              inputId={inputId}
             />
           ) : (
             <PlannedToolPlaceholder tool={selectedTool} />

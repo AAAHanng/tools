@@ -7,7 +7,7 @@ export default defineConfig({
   manifest: {
     name: "Browser Toolbox",
     description: "A lightweight toolbox for quick page actions and developer helpers.",
-    permissions: ["storage", "tabs"],
+    permissions: ["storage", "tabs", "contextMenus"],
     host_permissions: ["http://*/*", "https://*/*"],
     browser_specific_settings: {
       gecko: {

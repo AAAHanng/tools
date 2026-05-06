@@ -6,7 +6,7 @@ import {
   indentOnInput,
   syntaxHighlighting
 } from "@codemirror/language";
-import { EditorState, RangeSetBuilder } from "@codemirror/state";
+import { EditorSelection, EditorState, RangeSetBuilder } from "@codemirror/state";
 import {
   Decoration,
   drawSelection,
@@ -20,10 +20,22 @@ import {
 } from "@codemirror/view";
 import CodeMirror from "@uiw/react-codemirror";
 import clsx from "clsx";
-import { ChevronDown, ChevronRight, Copy, GripVertical, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, GripVertical, Redo2, Trash2, Undo2 } from "lucide-react";
 import React from "react";
 import { tags as t } from "@lezer/highlight";
-import { getJsonHistory, setJsonHistory, type JsonHistoryEntry } from "@/shared/storage";
+import {
+  consumePendingJsonInput,
+  getJsonHistory,
+  setJsonHistory,
+  type JsonHistoryEntry
+} from "@/shared/storage";
+import {
+  JsonHistoryDragProvider,
+  JsonHistoryDropZone,
+  JsonHistorySidebar,
+  reorderJsonHistoryEntries
+} from "@/components/ui/json-history-sidebar";
+import { DragHandle } from "@/components/ui/drag-handle";
 
 const JSON_SAMPLE = `{
   "hello": "world",
@@ -40,6 +52,15 @@ const JsonFlowViewer = React.lazy(() => import("./json-flow-viewer"));
 type ViewMode = "pretty" | "compact";
 type OutputView = "text" | "fold" | "flow";
 type InputView = "edit" | "fold";
+type JsonPathSegment = string | number;
+export type JsonPath = JsonPathSegment[];
+
+type JsonToolSnapshot = {
+  input: string;
+  indent: string;
+  sortKeys: boolean;
+  viewMode: ViewMode;
+};
 
 type JsonLintError = {
   summary: string;
@@ -62,6 +83,13 @@ type JsonViewerProps = {
   showLineNumbers?: boolean;
   editable?: boolean;
   onChange?: (nextValue: unknown) => void;
+  onSelectPath?: (path: JsonPath, value: unknown) => void;
+  selectedPath?: JsonPath | null;
+  dragState?: JsonDragState | null;
+  onDragStart?: (path: JsonPath) => void;
+  onDragOverPath?: (path: JsonPath, position: JsonDropPosition) => void;
+  onDropPath?: (path: JsonPath, position: JsonDropPosition) => void;
+  onDragEnd?: () => void;
 };
 
 type JsonNodeProps = {
@@ -76,6 +104,14 @@ type JsonNodeProps = {
   showLineNumbers?: boolean;
   editable?: boolean;
   onChange?: (nextValue: unknown) => void;
+  path?: JsonPath;
+  onSelectPath?: (path: JsonPath, value: unknown) => void;
+  selectedPath?: JsonPath | null;
+  dragState?: JsonDragState | null;
+  onDragStart?: (path: JsonPath) => void;
+  onDragOverPath?: (path: JsonPath, position: JsonDropPosition) => void;
+  onDropPath?: (path: JsonPath, position: JsonDropPosition) => void;
+  onDragEnd?: () => void;
 };
 
 type JsonLineProps = {
@@ -84,6 +120,29 @@ type JsonLineProps = {
   className?: string;
   children: React.ReactNode;
   actions?: React.ReactNode;
+  onSelect?: () => void;
+  selected?: boolean;
+  onDragOver?: (event: React.DragEvent<HTMLDivElement>) => void;
+  onDrop?: (event: React.DragEvent<HTMLDivElement>) => void;
+};
+
+type CopyPreview = {
+  title: string;
+  meta: string;
+  preview: string;
+};
+
+type JsonCopyMode = "property" | "value" | "object";
+type JsonDropPosition = "before" | "after";
+
+type JsonDropTarget = {
+  path: JsonPath;
+  position: JsonDropPosition;
+};
+
+type JsonDragState = {
+  path: JsonPath;
+  target?: JsonDropTarget;
 };
 
 const URL_PATTERN = /https?:\/\/[^\s"]+/gi;
@@ -98,6 +157,7 @@ const HUGE_LINE_THRESHOLD = 12_000;
 const TREE_CHILD_BATCH_SIZE = 200;
 const STRINGIFIED_JSON_PREFIX_PATTERN = /^\s*[\[{]/;
 const MAX_JSON_HISTORY_ITEMS = 18;
+const MAX_UNDO_STACK_SIZE = 80;
 
 const jsonHighlightStyle = syntaxHighlighting(
   HighlightStyle.define([
@@ -512,6 +572,8 @@ const baseEditorExtensions = [
   nestedJsonDecoratorExtension
 ];
 
+export const baseJsonEditorExtensions = baseEditorExtensions;
+
 function stringifyValue(value: unknown) {
   if (typeof value === "string") {
     return value;
@@ -544,6 +606,90 @@ function toClipboardJsonText(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
+function toClipboardValueText(value: unknown) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value === null
+  ) {
+    return String(value);
+  }
+
+  return JSON.stringify(value, null, 2);
+}
+
+function getCopyPreview(value: unknown, title?: string, clipboardText = toClipboardJsonText(value)): CopyPreview {
+  const compactPreview = clipboardText.replace(/\s+/g, " ").trim();
+  const preview =
+    compactPreview.length > 180
+      ? `${compactPreview.slice(0, 180)}...`
+      : compactPreview;
+
+  if (Array.isArray(value)) {
+    return {
+      title: title ?? "复制当前数组层",
+      meta: `${value.length} 项 · ${clipboardText.length} 字符`,
+      preview
+    };
+  }
+
+  if (typeof value === "object" && value !== null) {
+    return {
+      title: title ?? "复制当前对象层",
+      meta: `${Object.keys(value as Record<string, unknown>).length} 个字段 · ${clipboardText.length} 字符`,
+      preview
+    };
+  }
+
+  return {
+    title: title ?? "复制当前值",
+    meta: `${clipboardText.length} 字符`,
+    preview
+  };
+}
+
+function getJsonPropertyClipboardText(
+  label: string | undefined,
+  labelType: "key" | "item",
+  value: unknown
+) {
+  const valueText = toClipboardJsonText(value);
+
+  if (label === undefined) {
+    return valueText;
+  }
+
+  if (labelType === "key") {
+    return `${JSON.stringify(label)}: ${valueText}`;
+  }
+
+  return `item ${label}: ${valueText}`;
+}
+
+function getJsonPathClipboardText(path: JsonPath) {
+  if (!path.length) {
+    return "$";
+  }
+
+  return path
+    .map((segment, index) => {
+      if (typeof segment === "number") {
+        return `[${segment}]`;
+      }
+
+      if (/^[A-Za-z_$][\w$]*$/.test(segment)) {
+        return index === 0 ? segment : `.${segment}`;
+      }
+
+      return `[${JSON.stringify(segment)}]`;
+    })
+    .join("");
+}
+
 function getHistoryPreview(text: string) {
   const trimmed = text.trim();
 
@@ -568,7 +714,27 @@ function getItemCountText(count: number) {
   return `${count} ${count === 1 ? "item" : "items"}`;
 }
 
-function getDocumentMetrics(text: string) {
+function areSnapshotsEqual(
+  left: JsonToolSnapshot | undefined,
+  right: JsonToolSnapshot | undefined
+) {
+  return (
+    left?.input === right?.input &&
+    left?.indent === right?.indent &&
+    left?.sortKeys === right?.sortKeys &&
+    left?.viewMode === right?.viewMode
+  );
+}
+
+function isEditableShortcutTarget(target: EventTarget | null) {
+  const element = target instanceof HTMLElement ? target : null;
+
+  return Boolean(
+    element?.closest("input, textarea, [contenteditable='true'], .cm-editor")
+  );
+}
+
+export function getDocumentMetrics(text: string) {
   let lineCount = 1;
 
   for (let index = 0; index < text.length; index += 1) {
@@ -583,7 +749,7 @@ function getDocumentMetrics(text: string) {
   };
 }
 
-function getCursorMetrics(text: string, position: number) {
+export function getCursorMetrics(text: string, position: number) {
   let line = 1;
   let lastLineBreak = -1;
 
@@ -600,7 +766,7 @@ function getCursorMetrics(text: string, position: number) {
   };
 }
 
-function formatBytes(size: number) {
+export function formatBytes(size: number) {
   if (size < 1024) {
     return `${size} B`;
   }
@@ -687,6 +853,282 @@ function getStringSegments(value: string) {
   const matches = value.match(URL_PATTERN) ?? [];
 
   return { segments, matches };
+}
+
+function normalizeJsonDisplayString(value: string) {
+  return value.replace(/\r\n|\r|\n/g, ", ");
+}
+
+function areJsonPathsEqual(left: JsonPath | null | undefined, right: JsonPath | null | undefined) {
+  if (!left || !right || left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((segment, index) => segment === right[index]);
+}
+
+function getJsonParentPath(path: JsonPath) {
+  return path.slice(0, -1);
+}
+
+function areSameJsonParentPath(left: JsonPath, right: JsonPath) {
+  return areJsonPathsEqual(getJsonParentPath(left), getJsonParentPath(right));
+}
+
+function canReorderJsonPath(sourcePath: JsonPath, targetPath: JsonPath) {
+  return (
+    sourcePath.length > 0 &&
+    targetPath.length > 0 &&
+    !areJsonPathsEqual(sourcePath, targetPath) &&
+    areSameJsonParentPath(sourcePath, targetPath)
+  );
+}
+
+function reorderJsonValue(
+  root: unknown,
+  sourcePath: JsonPath,
+  targetPath: JsonPath,
+  position: JsonDropPosition
+) {
+  if (!canReorderJsonPath(sourcePath, targetPath)) {
+    return root;
+  }
+
+  const parentPath = getJsonParentPath(sourcePath);
+  const sourceKey = sourcePath[sourcePath.length - 1];
+  const targetKey = targetPath[targetPath.length - 1];
+
+  const reorderParent = (parent: unknown) => {
+    if (Array.isArray(parent)) {
+      if (typeof sourceKey !== "number" || typeof targetKey !== "number") {
+        return parent;
+      }
+
+      const next = [...parent];
+      const [moved] = next.splice(sourceKey, 1);
+      const targetIndexAfterRemoval =
+        sourceKey < targetKey ? targetKey - 1 : targetKey;
+      const insertIndex =
+        position === "before" ? targetIndexAfterRemoval : targetIndexAfterRemoval + 1;
+
+      next.splice(Math.max(0, Math.min(next.length, insertIndex)), 0, moved);
+      return next;
+    }
+
+    if (typeof parent === "object" && parent !== null) {
+      if (typeof sourceKey !== "string" || typeof targetKey !== "string") {
+        return parent;
+      }
+
+      const entries = Object.entries(parent as Record<string, unknown>);
+      const sourceIndex = entries.findIndex(([key]) => key === sourceKey);
+      const targetIndex = entries.findIndex(([key]) => key === targetKey);
+
+      if (sourceIndex < 0 || targetIndex < 0) {
+        return parent;
+      }
+
+      const nextEntries = [...entries];
+      const [moved] = nextEntries.splice(sourceIndex, 1);
+      const targetIndexAfterRemoval =
+        sourceIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      const insertIndex =
+        position === "before" ? targetIndexAfterRemoval : targetIndexAfterRemoval + 1;
+
+      nextEntries.splice(
+        Math.max(0, Math.min(nextEntries.length, insertIndex)),
+        0,
+        moved
+      );
+      return Object.fromEntries(nextEntries);
+    }
+
+    return parent;
+  };
+
+  const updateAtPath = (value: unknown, path: JsonPath): unknown => {
+    if (!path.length) {
+      return reorderParent(value);
+    }
+
+    const [head, ...tail] = path;
+
+    if (typeof head === "number") {
+      if (!Array.isArray(value)) {
+        return value;
+      }
+
+      return value.map((item, index) =>
+        index === head ? updateAtPath(item, tail) : item
+      );
+    }
+
+    if (typeof value !== "object" || value === null) {
+      return value;
+    }
+
+    return {
+      ...(value as Record<string, unknown>),
+      [head]: updateAtPath((value as Record<string, unknown>)[head], tail)
+    };
+  };
+
+  return updateAtPath(root, parentPath);
+}
+
+export function findJsonPathPosition(source: string, path: JsonPath) {
+  if (!path.length) {
+    return 0;
+  }
+
+  const skipWhitespace = (index: number) => {
+    let current = index;
+
+    while (/\s/.test(source[current] ?? "")) {
+      current += 1;
+    }
+
+    return current;
+  };
+
+  const readString = (index: number) => {
+    let current = index + 1;
+    let escaped = false;
+
+    while (current < source.length) {
+      const character = source[current];
+
+      if (escaped) {
+        escaped = false;
+        current += 1;
+        continue;
+      }
+
+      if (character === "\\") {
+        escaped = true;
+        current += 1;
+        continue;
+      }
+
+      if (character === "\"") {
+        return {
+          end: current + 1,
+          value: JSON.parse(source.slice(index, current + 1)) as string
+        };
+      }
+
+      current += 1;
+    }
+
+    return null;
+  };
+
+  const pathsEqual = (left: JsonPath, right: JsonPath) =>
+    left.length === right.length &&
+    left.every((segment, index) => segment === right[index]);
+
+  const walkValue = (index: number, currentPath: JsonPath): { end: number; position?: number } => {
+    const valueStart = skipWhitespace(index);
+    const token = source[valueStart];
+
+    if (pathsEqual(currentPath, path)) {
+      return { end: valueStart, position: valueStart };
+    }
+
+    if (token === "{") {
+      return walkObject(valueStart, currentPath);
+    }
+
+    if (token === "[") {
+      return walkArray(valueStart, currentPath);
+    }
+
+    if (token === "\"") {
+      const text = readString(valueStart);
+      return { end: text?.end ?? valueStart + 1 };
+    }
+
+    const primitiveEnd = source.slice(valueStart).search(/[,\]}]/);
+    return {
+      end: primitiveEnd < 0 ? source.length : valueStart + primitiveEnd
+    };
+  };
+
+  const walkObject = (index: number, currentPath: JsonPath): { end: number; position?: number } => {
+    let current = skipWhitespace(index + 1);
+
+    while (current < source.length && source[current] !== "}") {
+      const keyStart = current;
+      const key = readString(keyStart);
+
+      if (!key) {
+        return { end: current };
+      }
+
+      const childPath = [...currentPath, key.value];
+      current = skipWhitespace(key.end);
+
+      if (source[current] !== ":") {
+        return { end: current };
+      }
+
+      if (pathsEqual(childPath, path)) {
+        return { end: key.end, position: keyStart };
+      }
+
+      const child = walkValue(current + 1, childPath);
+
+      if (child.position !== undefined) {
+        return child;
+      }
+
+      current = skipWhitespace(child.end);
+
+      if (source[current] === ",") {
+        current = skipWhitespace(current + 1);
+      }
+    }
+
+    return { end: current + 1 };
+  };
+
+  const walkArray = (index: number, currentPath: JsonPath): { end: number; position?: number } => {
+    let current = skipWhitespace(index + 1);
+    let itemIndex = 0;
+
+    while (current < source.length && source[current] !== "]") {
+      const child = walkValue(current, [...currentPath, itemIndex]);
+
+      if (child.position !== undefined) {
+        return child;
+      }
+
+      current = skipWhitespace(child.end);
+      itemIndex += 1;
+
+      if (source[current] === ",") {
+        current = skipWhitespace(current + 1);
+      }
+    }
+
+    return { end: current + 1 };
+  };
+
+  return walkValue(0, []).position ?? 0;
+}
+
+function getValueByPath(root: unknown, path: JsonPath) {
+  return path.reduce<unknown>((current, segment) => {
+    if (typeof segment === "number") {
+      return Array.isArray(current) ? current[segment] : undefined;
+    }
+
+    if (typeof current !== "object" || current === null) {
+      return undefined;
+    }
+
+    return (current as Record<string, unknown>)[segment];
+  }, root);
 }
 
 function sortJsonValue(value: unknown): unknown {
@@ -828,7 +1270,7 @@ function lookupByPath(root: unknown, path: string): PathQueryResult {
 
 function JsonPrimitive({ value }: { value: unknown }) {
   if (typeof value === "string") {
-    const escapedValue = JSON.stringify(value).slice(1, -1);
+    const escapedValue = JSON.stringify(normalizeJsonDisplayString(value)).slice(1, -1);
     const { segments, matches } = getStringSegments(escapedValue);
 
     return (
@@ -870,10 +1312,55 @@ function JsonPrimitive({ value }: { value: unknown }) {
 }
 
 function JsonLine(props: JsonLineProps) {
-  const { depth, showLineNumbers = true, className, children, actions } = props;
+  const {
+    depth,
+    showLineNumbers = true,
+    className,
+    children,
+    actions,
+    onSelect,
+    selected = false,
+    onDragOver,
+    onDrop
+  } = props;
 
   return (
-    <div className={clsx("json-line", className, showLineNumbers && "has-line-number")}>
+    <div
+      className={clsx(
+        "json-line",
+        className,
+        showLineNumbers && "has-line-number",
+        onSelect && "is-selectable",
+        selected && "is-selected"
+      )}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+      onClick={(event) => {
+        if (!onSelect) {
+          return;
+        }
+
+        const target = event.target instanceof HTMLElement ? event.target : null;
+
+        if (target?.closest("button, a, input")) {
+          return;
+        }
+
+        onSelect();
+      }}
+      role={onSelect ? "button" : undefined}
+      tabIndex={onSelect ? 0 : undefined}
+      onKeyDown={
+        onSelect
+          ? (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onSelect();
+              }
+            }
+          : undefined
+      }
+    >
       {showLineNumbers ? <span className="json-line-number" aria-hidden="true" /> : null}
       <div
         className="json-line-content"
@@ -959,7 +1446,15 @@ function JsonNode(props: JsonNodeProps) {
     childBatchSize,
     showLineNumbers = true,
     editable = false,
-    onChange
+    onChange,
+    path = [],
+    onSelectPath,
+    selectedPath,
+    dragState,
+    onDragStart,
+    onDragOverPath,
+    onDropPath,
+    onDragEnd
   } = props;
   const nestedJson = React.useMemo(
     () => (typeof value === "string" ? resolveStringifiedJson(value) : null),
@@ -980,6 +1475,8 @@ function JsonNode(props: JsonNodeProps) {
   const [visibleCount, setVisibleCount] = React.useState(
     Math.min(entries.length, batchSize)
   );
+  const [showCopyPreview, setShowCopyPreview] = React.useState(false);
+  const [copyPreviewMode, setCopyPreviewMode] = React.useState<JsonCopyMode>("object");
   const countText = getItemCountText(entries.length);
 
   React.useEffect(() => {
@@ -993,43 +1490,155 @@ function JsonNode(props: JsonNodeProps) {
   const visibleEntries = entries.slice(0, visibleCount);
   const hiddenCount = Math.max(0, entries.length - visibleCount);
   const copyValue = nestedJson ? resolvedValue : value;
+  const pathText = React.useMemo(() => getJsonPathClipboardText(path), [path]);
+  const copyTexts = React.useMemo(
+    () => ({
+      property: pathText,
+      value: toClipboardValueText(copyValue),
+      object: getJsonPropertyClipboardText(label, labelType, copyValue)
+    }),
+    [copyValue, label, labelType, pathText]
+  );
+  const copyPreview = React.useMemo(() => {
+    if (copyPreviewMode === "property") {
+      return getCopyPreview(copyValue, "copy property", copyTexts.property);
+    }
+
+    if (copyPreviewMode === "value") {
+      return getCopyPreview(copyValue, "复制value", copyTexts.value);
+    }
+
+    return getCopyPreview(copyValue, "复制对象", copyTexts.object);
+  }, [copyPreviewMode, copyTexts.object, copyTexts.property, copyTexts.value, copyValue]);
+  const selected = areJsonPathsEqual(path, selectedPath);
+  const canDragNode = path.length > 0 && Boolean(onDragStart && onDropPath);
+  const dropPosition = dragState?.target && areJsonPathsEqual(dragState.target.path, path)
+    ? dragState.target.position
+    : undefined;
+  const selectCurrentPath = React.useCallback(() => {
+    onSelectPath?.(path, copyValue);
+  }, [copyValue, onSelectPath, path]);
+  const handleDragOverLine = React.useCallback(
+    (event: React.DragEvent<HTMLElement>) => {
+      if (!dragState || !canReorderJsonPath(dragState.path, path)) {
+        return;
+      }
+
+      const rect = event.currentTarget.getBoundingClientRect();
+      const position: JsonDropPosition =
+        event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      onDragOverPath?.(path, position);
+    },
+    [dragState, onDragOverPath, path]
+  );
+  const handleDropLine = React.useCallback(
+    (event: React.DragEvent<HTMLElement>) => {
+      if (!dragState || !dropPosition || !canReorderJsonPath(dragState.path, path)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      onDropPath?.(path, dropPosition);
+    },
+    [dragState, dropPosition, onDropPath, path]
+  );
   const lineActions = (
-    <button
-      className="json-node-action"
-      onClick={() => navigator.clipboard.writeText(toClipboardJsonText(copyValue))}
-      type="button"
-      title="复制当前层"
-    >
-      <Copy size={13} />
-      <span>复制当前层</span>
-    </button>
+    <span className="json-copy-action-wrap">
+      {([
+        ["property", "copy property"],
+        ["value", "复制value"],
+        ["object", "复制对象"]
+      ] as const).map(([mode, text]) => (
+        <button
+          key={mode}
+          className="json-node-action"
+          onBlur={() => setShowCopyPreview(false)}
+          onClick={(event) => {
+            event.stopPropagation();
+            void navigator.clipboard.writeText(copyTexts[mode]);
+            setShowCopyPreview(false);
+            event.currentTarget.blur();
+          }}
+          onFocus={() => {
+            setCopyPreviewMode(mode);
+            setShowCopyPreview(true);
+          }}
+          onMouseEnter={() => {
+            setCopyPreviewMode(mode);
+            setShowCopyPreview(true);
+          }}
+          onMouseLeave={() => setShowCopyPreview(false)}
+          type="button"
+          title={text}
+        >
+          <Copy size={13} />
+          <span>{text}</span>
+        </button>
+      ))}
+      {showCopyPreview ? (
+        <span className="json-copy-preview" role="tooltip">
+          <strong>{copyPreview.title}</strong>
+          <span>{copyPreview.meta}</span>
+          <code>{copyPreview.preview}</code>
+        </span>
+      ) : null}
+    </span>
   );
 
-  if (!isExpandable) {
+  if (!isExpandable || entries.length === 0) {
     return (
-      <JsonLine
-        depth={depth}
-        showLineNumbers={showLineNumbers}
-        actions={lineActions}
+      <div
+        className={clsx("json-layer", "json-layer-leaf", showCopyPreview && "is-copy-target")}
       >
-        <span className="json-arrow-spacer" />
-        {label !== undefined ? (
-          <>
-            {labelType === "key" ? (
-              <span className="json-key">"{label}"</span>
-            ) : (
-              <span className="json-item-label">item {label}</span>
-            )}
-            <span className="json-punctuation">: </span>
-          </>
-        ) : null}
-        {editable && onChange ? (
-          <EditableJsonPrimitive value={value} onCommit={onChange} />
-        ) : (
-          <JsonPrimitive value={value} />
-        )}
-        {!isLast ? <span className="json-punctuation">,</span> : null}
-      </JsonLine>
+        <JsonLine
+          depth={depth}
+          showLineNumbers={showLineNumbers}
+          className={clsx(dropPosition && `is-drop-${dropPosition}`)}
+          actions={lineActions}
+          onSelect={onSelectPath ? selectCurrentPath : undefined}
+          selected={selected}
+          onDragOver={handleDragOverLine}
+          onDrop={handleDropLine}
+        >
+          {canDragNode ? (
+            <span className="json-row-tools">
+              <DragHandle
+                onDragEnd={onDragEnd}
+                onDragStart={(event: React.DragEvent<HTMLButtonElement>) => {
+                  event.stopPropagation();
+                  event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData("text/plain", pathText);
+                  onDragStart?.(path);
+                }}
+              />
+            </span>
+          ) : (
+            <span className="json-arrow-spacer" />
+          )}
+          {label !== undefined ? (
+            <>
+              {labelType === "key" ? (
+                <span className="json-key">"{label}"</span>
+              ) : (
+                <span className="json-item-label">item {label}</span>
+              )}
+              <span className="json-punctuation json-label-separator">: </span>
+            </>
+          ) : null}
+          {isExpandable ? (
+            <span className="json-punctuation">{isArray ? "[]" : "{}"}</span>
+          ) : editable && onChange ? (
+            <EditableJsonPrimitive value={value} onCommit={onChange} />
+          ) : (
+            <JsonPrimitive value={value} />
+          )}
+          {!isLast ? <span className="json-punctuation">,</span> : null}
+        </JsonLine>
+      </div>
     );
   }
 
@@ -1040,19 +1649,40 @@ function JsonNode(props: JsonNodeProps) {
       : "object";
 
   return (
-    <div className="json-block">
+    <div className={clsx("json-block", "json-layer", showCopyPreview && "is-copy-target")}>
       <JsonLine
         depth={depth}
         showLineNumbers={showLineNumbers}
+        className={clsx(dropPosition && `is-drop-${dropPosition}`)}
         actions={lineActions}
+        onSelect={onSelectPath ? selectCurrentPath : undefined}
+        selected={selected}
+        onDragOver={handleDragOverLine}
+        onDrop={handleDropLine}
       >
-        <button
-          className="json-arrow"
-          onClick={() => setOpen((current) => !current)}
-          aria-label={open ? "Collapse" : "Expand"}
-        >
-          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        </button>
+        <span className="json-row-tools">
+          {canDragNode ? (
+            <DragHandle
+              onDragEnd={onDragEnd}
+              onDragStart={(event: React.DragEvent<HTMLButtonElement>) => {
+                event.stopPropagation();
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", pathText);
+                onDragStart?.(path);
+              }}
+            />
+          ) : null}
+          <button
+            className="json-arrow"
+            onClick={(event) => {
+              event.stopPropagation();
+              setOpen((current) => !current);
+            }}
+            aria-label={open ? "Collapse" : "Expand"}
+          >
+            {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          </button>
+        </span>
         {label !== undefined ? (
           <>
             {labelType === "key" ? (
@@ -1060,7 +1690,7 @@ function JsonNode(props: JsonNodeProps) {
             ) : (
               <span className="json-item-label">item {label}</span>
             )}
-            <span className="json-punctuation">: </span>
+            <span className="json-punctuation json-label-separator">: </span>
           </>
         ) : null}
         {nestedJson ? (
@@ -1095,6 +1725,17 @@ function JsonNode(props: JsonNodeProps) {
                 childBatchSize={childBatchSize}
                 showLineNumbers={showLineNumbers}
                 editable={editable}
+                path={[
+                  ...path,
+                  isArray ? Number(entryLabel) : entryLabel
+                ]}
+                onSelectPath={onSelectPath}
+                selectedPath={selectedPath}
+                dragState={dragState}
+                onDragStart={onDragStart}
+                onDragOverPath={onDragOverPath}
+                onDropPath={onDropPath}
+                onDragEnd={onDragEnd}
                 onChange={
                   editable
                     ? (nextChildValue) => {
@@ -1167,7 +1808,14 @@ function JsonViewer(props: JsonViewerProps) {
     childBatchSize,
     showLineNumbers = true,
     editable = false,
-    onChange
+    onChange,
+    onSelectPath,
+    selectedPath,
+    dragState,
+    onDragStart,
+    onDragOverPath,
+    onDropPath,
+    onDragEnd
   } = props;
 
   return (
@@ -1182,12 +1830,20 @@ function JsonViewer(props: JsonViewerProps) {
         showLineNumbers={showLineNumbers}
         editable={editable}
         onChange={onChange}
+        path={[]}
+        onSelectPath={onSelectPath}
+        selectedPath={selectedPath}
+        dragState={dragState}
+        onDragStart={onDragStart}
+        onDragOverPath={onDragOverPath}
+        onDropPath={onDropPath}
+        onDragEnd={onDragEnd}
       />
     </div>
   );
 }
 
-export function JsonFormatTool() {
+export function JsonFormatTool({ inputId }: { inputId?: string }) {
   const [input, setInput] = React.useState(JSON_SAMPLE);
   const [error, setError] = React.useState<JsonLintError | null>(null);
   const [indent, setIndent] = React.useState("2");
@@ -1206,6 +1862,8 @@ export function JsonFormatTool() {
     state: "idle",
     message: ""
   });
+  const [selectedOutputPath, setSelectedOutputPath] = React.useState<JsonPath | null>(null);
+  const [jsonDragState, setJsonDragState] = React.useState<JsonDragState | null>(null);
   const [treeDepth, setTreeDepth] = React.useState(2);
   const [parsedValue, setParsedValue] = React.useState<unknown>(
     JSON.parse(JSON_SAMPLE)
@@ -1214,10 +1872,82 @@ export function JsonFormatTool() {
     JSON.stringify(JSON.parse(JSON_SAMPLE), null, 2)
   );
   const [leftPaneWidth, setLeftPaneWidth] = React.useState(34);
+  const inputEditorViewRef = React.useRef<EditorView | null>(null);
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
   const dragStateRef = React.useRef<{
     active: boolean;
   }>({ active: false });
+  const undoStackRef = React.useRef<JsonToolSnapshot[]>([]);
+  const redoStackRef = React.useRef<JsonToolSnapshot[]>([]);
+  const [historyRevision, setHistoryRevision] = React.useState(0);
+
+  const getSnapshot = React.useCallback(
+    (): JsonToolSnapshot => ({
+      input,
+      indent,
+      sortKeys,
+      viewMode
+    }),
+    [indent, input, sortKeys, viewMode]
+  );
+
+  const restoreSnapshot = React.useCallback((snapshot: JsonToolSnapshot) => {
+    setInput(snapshot.input);
+    setIndent(snapshot.indent);
+    setSortKeys(snapshot.sortKeys);
+    setViewMode(snapshot.viewMode);
+  }, []);
+
+  const pushUndoSnapshot = React.useCallback((snapshot: JsonToolSnapshot) => {
+    const stack = undoStackRef.current;
+    const previous = stack[stack.length - 1];
+
+    if (areSnapshotsEqual(previous, snapshot)) {
+      return;
+    }
+
+    undoStackRef.current = [...stack, snapshot].slice(-MAX_UNDO_STACK_SIZE);
+    redoStackRef.current = [];
+    setHistoryRevision((current) => current + 1);
+  }, []);
+
+  const runUndoableChange = React.useCallback(
+    (change: () => void) => {
+      pushUndoSnapshot(getSnapshot());
+      change();
+    },
+    [getSnapshot, pushUndoSnapshot]
+  );
+
+  const undoToolChange = React.useCallback(() => {
+    const previous = undoStackRef.current.at(-1);
+
+    if (!previous) {
+      return;
+    }
+
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    redoStackRef.current = [...redoStackRef.current, getSnapshot()].slice(
+      -MAX_UNDO_STACK_SIZE
+    );
+    restoreSnapshot(previous);
+    setHistoryRevision((current) => current + 1);
+  }, [getSnapshot, restoreSnapshot]);
+
+  const redoToolChange = React.useCallback(() => {
+    const next = redoStackRef.current.at(-1);
+
+    if (!next) {
+      return;
+    }
+
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    undoStackRef.current = [...undoStackRef.current, getSnapshot()].slice(
+      -MAX_UNDO_STACK_SIZE
+    );
+    restoreSnapshot(next);
+    setHistoryRevision((current) => current + 1);
+  }, [getSnapshot, restoreSnapshot]);
 
   const inputMetrics = React.useMemo(() => getDocumentMetrics(input), [input]);
   const outputMetrics = React.useMemo(
@@ -1238,6 +1968,31 @@ export function JsonFormatTool() {
       setHistoryEntries(entries);
     });
   }, []);
+
+  React.useEffect(() => {
+    if (!inputId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void consumePendingJsonInput(inputId).then((pendingInput) => {
+      if (cancelled || !pendingInput) {
+        return;
+      }
+
+      setInput(pendingInput.content);
+      setInputView("edit");
+      setOutputView("fold");
+      undoStackRef.current = [];
+      redoStackRef.current = [];
+      setHistoryRevision((current) => current + 1);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [inputId]);
 
   const saveHistoryEntries = React.useCallback((updater: (current: JsonHistoryEntry[]) => JsonHistoryEntry[]) => {
     setHistoryEntries((current) => {
@@ -1347,13 +2102,87 @@ export function JsonFormatTool() {
     };
   }, []);
 
-  const copyOutput = async () => {
+  const copyOutput = React.useCallback(async () => {
     if (!outputText) {
       return;
     }
 
     await navigator.clipboard.writeText(outputText);
-  };
+  }, [outputText]);
+
+  const jumpInputEditorToPath = React.useCallback(
+    (path: JsonPath) => {
+      setSelectedOutputPath(path);
+      setInputView("edit");
+
+      window.requestAnimationFrame(() => {
+        const view = inputEditorViewRef.current;
+
+        if (!view) {
+          return;
+        }
+
+        try {
+          const position = findJsonPathPosition(input, path);
+          view.dispatch({
+            selection: EditorSelection.cursor(position),
+            effects: EditorView.scrollIntoView(position, {
+              y: "center",
+              x: "nearest"
+            })
+          });
+          view.focus();
+          setCursorMetrics(getCursorMetrics(view.state.doc.toString(), position));
+        } catch {
+          return;
+        }
+      });
+    },
+    [input]
+  );
+
+  React.useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      const isModifierPressed = event.metaKey || event.ctrlKey;
+
+      if (!isModifierPressed) {
+        return;
+      }
+
+      if (key === "s") {
+        event.preventDefault();
+        keepCurrentHistoryEntry(outputText);
+        return;
+      }
+
+      if (isEditableShortcutTarget(event.target)) {
+        return;
+      }
+
+      if (key === "z" && !event.shiftKey) {
+        event.preventDefault();
+        undoToolChange();
+        return;
+      }
+
+      if (key === "y" || (key === "z" && event.shiftKey)) {
+        event.preventDefault();
+        redoToolChange();
+      }
+    };
+
+    window.addEventListener("keydown", handleShortcut);
+
+    return () => {
+      window.removeEventListener("keydown", handleShortcut);
+    };
+  }, [
+    keepCurrentHistoryEntry,
+    outputText,
+    redoToolChange,
+    undoToolChange
+  ]);
 
   const handleInputEditorChange = React.useCallback((value: string) => {
     setInput(value);
@@ -1386,7 +2215,7 @@ export function JsonFormatTool() {
   const applyInputTransform = (transform: (current: string) => string) => {
     try {
       const nextValue = transform(input);
-      setInput(nextValue);
+      runUndoableChange(() => setInput(nextValue));
     } catch (transformError) {
       setError({
         summary:
@@ -1398,6 +2227,43 @@ export function JsonFormatTool() {
     }
   };
 
+  const setViewModeUndoable = React.useCallback(
+    (nextViewMode: ViewMode) => {
+      if (nextViewMode === viewMode) {
+        return;
+      }
+
+      runUndoableChange(() => setViewMode(nextViewMode));
+    },
+    [runUndoableChange, viewMode]
+  );
+
+  const setIndentUndoable = React.useCallback(
+    (nextIndent: string) => {
+      if (nextIndent === indent) {
+        return;
+      }
+
+      runUndoableChange(() => setIndent(nextIndent));
+    },
+    [indent, runUndoableChange]
+  );
+
+  const toggleSortUndoable = React.useCallback(() => {
+    runUndoableChange(() => setSortKeys((current) => !current));
+  }, [runUndoableChange]);
+
+  const loadHistoryEntry = React.useCallback(
+    (content: string) => {
+      if (content === input) {
+        return;
+      }
+
+      runUndoableChange(() => setInput(content));
+    },
+    [input, runUndoableChange]
+  );
+
   const applyStructuredOutputChange = React.useCallback(
     (nextValue: unknown) => {
       try {
@@ -1406,14 +2272,45 @@ export function JsonFormatTool() {
         setParsedValue(normalized);
         const nextOutput = JSON.stringify(normalized, null, space);
         setOutputText(nextOutput);
-        setInput(nextOutput);
+        runUndoableChange(() => setInput(nextOutput));
         setError(null);
         setParseRevision((current) => current + 1);
       } catch (changeError) {
         setError(buildJsonLintError(input, changeError));
       }
     },
-    [indent, input, sortKeys, viewMode]
+    [indent, input, runUndoableChange, sortKeys, viewMode]
+  );
+
+  const applyJsonReorder = React.useCallback(
+    (targetPath: JsonPath, position: JsonDropPosition) => {
+      const sourcePath = jsonDragState?.path;
+
+      if (!sourcePath || !canReorderJsonPath(sourcePath, targetPath)) {
+        setJsonDragState(null);
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(input);
+        const reordered = reorderJsonValue(parsed, sourcePath, targetPath, position);
+        const normalized = sortKeys ? sortJsonValue(reordered) : reordered;
+        const space = viewMode === "pretty" ? Number(indent) || 2 : 0;
+        const nextOutput = JSON.stringify(normalized, null, space);
+
+        setParsedValue(normalized);
+        setOutputText(nextOutput);
+        runUndoableChange(() => setInput(nextOutput));
+        setSelectedOutputPath(targetPath);
+        setError(null);
+        setParseRevision((current) => current + 1);
+      } catch (reorderError) {
+        setError(buildJsonLintError(input, reorderError));
+      } finally {
+        setJsonDragState(null);
+      }
+    },
+    [indent, input, jsonDragState?.path, runUndoableChange, sortKeys, viewMode]
   );
 
   const outputDepth = outputView === "text" || outputView === "flow" ? 99 : treeDepth;
@@ -1421,6 +2318,8 @@ export function JsonFormatTool() {
   const outputResetToken = `${outputView}-${outputDepth}-${sortKeys}-${parseRevision}`;
   const editorFontSize = Math.max(12, Math.min(28, Number(fontSize) || 13));
   const isAllExpanded = outputView === "fold" && treeDepth >= 99;
+  const canUndoToolChange = historyRevision >= 0 && undoStackRef.current.length > 0;
+  const canRedoToolChange = historyRevision >= 0 && redoStackRef.current.length > 0;
   const toggleExpandAll = () => {
     setOutputView("fold");
     setTreeDepth(isAllExpanded ? 1 : 99);
@@ -1579,78 +2478,66 @@ export function JsonFormatTool() {
         </section>
       ) : null}
 
-      <div className="tool-layout-with-history">
-        <aside className="history-sidebar">
-          <div className="history-sidebar-head">
-            <div className="history-sidebar-head-copy">
-              <strong>更新记录</strong>
-              <span>{historyEntries.length} 条</span>
-            </div>
-            <button
-              className="mini-switch"
-              onClick={() => keepCurrentHistoryEntry(outputText)}
-              type="button"
-              disabled={Boolean(error) || !outputText.trim()}
-            >
-              保留当前
-            </button>
-          </div>
-          <div className="history-list">
-            {historyEntries.length ? (
-              historyEntries.map((entry) => (
-                <div key={entry.id} className="history-item">
-                  <button
-                    className="history-item-main"
-                    onClick={() => setInput(entry.content)}
-                    type="button"
-                  >
-                    <span className="history-item-time">
-                      {formatHistoryTime(entry.updatedAt)}
-                    </span>
-                    <strong>{getHistoryPreview(entry.content)}</strong>
-                    <span className="history-item-meta">
-                      {entry.content.length} chars
-                    </span>
-                  </button>
-                  <div className="history-item-actions">
-                    <button
-                      className="mini-switch danger-switch"
-                      onClick={() => {
-                        if (!window.confirm("确认删除这条记录？")) {
-                          return;
-                        }
+      <JsonHistoryDragProvider>
+        <div className="tool-layout-with-history">
+          <JsonHistorySidebar
+            emptyText="点击“保留当前”后会出现在这里"
+            entries={historyEntries}
+            headAction={
+              <button
+                className="mini-switch"
+                onClick={() => keepCurrentHistoryEntry(outputText)}
+                type="button"
+                disabled={Boolean(error) || !outputText.trim()}
+              >
+                保留当前
+              </button>
+            }
+            onEntryClick={(entry) => setInput(entry.content)}
+            onReorder={(sourceId, targetId, position) => {
+              saveHistoryEntries((current) =>
+                reorderJsonHistoryEntries(current, sourceId, targetId, position)
+              );
+            }}
+            renderActions={(entry) => (
+              <button
+                className="mini-switch danger-switch"
+                onClick={() => {
+                  if (!window.confirm("确认删除这条记录？")) {
+                    return;
+                  }
 
-                        saveHistoryEntries((current) =>
-                          current.filter((item) => item.id !== entry.id)
-                        );
-                      }}
-                      type="button"
-                    >
-                      <Trash2 size={14} />
-                      <span>删除</span>
-                    </button>
-                  </div>
-                </div>
-              ))
-            ) : (
-              <div className="history-empty">点击“保留当前”后会出现在这里</div>
+                  saveHistoryEntries((current) =>
+                    current.filter((item) => item.id !== entry.id)
+                  );
+                }}
+                type="button"
+              >
+                <Trash2 size={14} />
+                <span>删除</span>
+              </button>
             )}
-          </div>
-        </aside>
+          />
 
-        <div
-          ref={splitContainerRef}
-          className="resizable-workbench"
-          style={
-            {
-              "--left-pane-width": `${leftPaneWidth}%`
-            } as React.CSSProperties
-          }
+          <div
+            ref={splitContainerRef}
+            className="resizable-workbench"
+            style={
+              {
+                "--left-pane-width": `${leftPaneWidth}%`
+              } as React.CSSProperties
+            }
+          >
+        <JsonHistoryDropZone
+          as="section"
+          className={clsx("editor-panel", error && "is-error-panel")}
+          onDropEntry={(entry) => {
+            runUndoableChange(() => setInput(entry.content));
+            setInputView("edit");
+          }}
         >
-        <section className={clsx("editor-panel", error && "is-error-panel")}>
           <div className="editor-panel-head">
             <div className="editor-panel-head-main">
-              <strong>输入</strong>
               <span>
                 行 {cursorMetrics.line} / 列 {cursorMetrics.column} · 共 {inputMetrics.lineCount} 行 · {formatBytes(inputMetrics.charCount)}
                 {shouldUseLightweightInput ? " · 轻量模式" : ""}
@@ -1678,6 +2565,9 @@ export function JsonFormatTool() {
                 height="100%"
                 extensions={inputEditorExtensions}
                 onChange={handleInputEditorChange}
+                onCreateEditor={(view) => {
+                  inputEditorViewRef.current = view;
+                }}
                 basicSetup={{
                   foldGutter: true,
                   lineNumbers: true
@@ -1699,6 +2589,15 @@ export function JsonFormatTool() {
                     resetToken={`input-${treeResetToken}`}
                     childBatchSize={shouldUseLightweightInput ? TREE_CHILD_BATCH_SIZE : undefined}
                     showLineNumbers
+                    dragState={jsonDragState}
+                    onDragStart={(path) => setJsonDragState({ path })}
+                    onDragOverPath={(path, position) =>
+                      setJsonDragState((current) =>
+                        current ? { ...current, target: { path, position } } : current
+                      )
+                    }
+                    onDropPath={applyJsonReorder}
+                    onDragEnd={() => setJsonDragState(null)}
                   />
                 </div>
               ) : (
@@ -1716,7 +2615,7 @@ export function JsonFormatTool() {
               )}
             </div>
           )}
-        </section>
+        </JsonHistoryDropZone>
 
         <div
           className="splitter"
@@ -1728,10 +2627,16 @@ export function JsonFormatTool() {
           <GripVertical size={14} />
         </div>
 
-        <section className={clsx("editor-panel", error && "is-error-panel")}>
+        <JsonHistoryDropZone
+          as="section"
+          className={clsx("editor-panel", error && "is-error-panel")}
+          onDropEntry={(entry) => {
+            runUndoableChange(() => setInput(entry.content));
+            setOutputView("fold");
+          }}
+        >
           <div className="editor-panel-head">
             <div className="editor-panel-head-main">
-              <strong>输出</strong>
               <span>
                 {isProcessing
                   ? "处理中..."
@@ -1795,7 +2700,10 @@ export function JsonFormatTool() {
                     </div>
                   }
                 >
-                  <JsonFlowViewer value={parsedValue} />
+                  <JsonFlowViewer
+                    value={parsedValue}
+                    onSelectPath={(path) => jumpInputEditorToPath(path)}
+                  />
                 </React.Suspense>
               ) : (
                 <div className="output-content">
@@ -1807,6 +2715,17 @@ export function JsonFormatTool() {
                     showLineNumbers
                     editable
                     onChange={applyStructuredOutputChange}
+                    onSelectPath={(path) => jumpInputEditorToPath(path)}
+                    selectedPath={selectedOutputPath}
+                    dragState={jsonDragState}
+                    onDragStart={(path) => setJsonDragState({ path })}
+                    onDragOverPath={(path, position) =>
+                      setJsonDragState((current) =>
+                        current ? { ...current, target: { path, position } } : current
+                      )
+                    }
+                    onDropPath={applyJsonReorder}
+                    onDragEnd={() => setJsonDragState(null)}
                   />
                 </div>
               )
@@ -1824,9 +2743,10 @@ export function JsonFormatTool() {
               </div>
             )}
           </div>
-        </section>
+        </JsonHistoryDropZone>
         </div>
       </div>
+      </JsonHistoryDragProvider>
     </div>
   );
 }

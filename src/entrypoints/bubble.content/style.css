@@ -2,21 +2,27 @@
   all: initial;
   position: fixed;
   z-index: 2147483646;
-  display: grid;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   width: 52px;
   height: 52px;
   border: none;
   border-radius: 999px;
   background: linear-gradient(135deg, #101828, #2563eb);
   color: #f8fafc;
+  font: 600 13px/1 "SF Pro Display", "PingFang SC", "Segoe UI", sans-serif;
   box-shadow: 0 16px 36px rgba(15, 23, 42, 0.28);
   cursor: grab;
   user-select: none;
-  transition: transform 120ms ease, box-shadow 120ms ease;
+  overflow: hidden;
+  white-space: nowrap;
+  transition: width 140ms ease, transform 120ms ease, box-shadow 120ms ease;
 }
 
 .bubble-root:hover {
+  width: 88px;
   transform: translateY(-1px) scale(1.02);
   box-shadow: 0 18px 42px rgba(15, 23, 42, 0.32);
 }
@@ -26,3 +32,15 @@
   transform: scale(0.98);
 }
 
+.bubble-root span {
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition: max-width 140ms ease, opacity 120ms ease;
+}
+
+.bubble-root:hover span,
+.bubble-root:focus-visible span {
+  max-width: 32px;
+  opacity: 1;
+}

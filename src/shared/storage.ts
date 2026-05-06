@@ -19,11 +19,30 @@ export type JsonHistoryEntry = {
   updatedAt: number;
 };
 
+export type UrlParamShortcut = {
+  id: string;
+  name: string;
+  key: string;
+  value: string;
+  hotkey?: string;
+  updatedAt: number;
+};
+
+export type PendingJsonInput = {
+  id: string;
+  content: string;
+  sourceUrl?: string;
+  sourceHost?: string;
+  createdAt: number;
+};
+
 type HostConfigMap = Record<string, HostConfig>;
 
 const GLOBAL_CONFIG_KEY = "globalConfig";
 const HOST_CONFIGS_KEY = "hostConfigs";
 const JSON_HISTORY_KEY = "jsonFormatHistory";
+const URL_PARAM_SHORTCUTS_KEY = "urlParamShortcuts";
+const PENDING_JSON_INPUT_KEY = "pendingJsonFormatInput";
 
 export const DEFAULT_GLOBAL_CONFIG: GlobalConfig = {
   enabled: true,
@@ -35,6 +54,25 @@ export const DEFAULT_HOST_CONFIG: HostConfig = {
   mode: "bubble",
   bubblePosition: { x: 24, y: 120 }
 };
+
+export const DEFAULT_URL_PARAM_SHORTCUTS: UrlParamShortcut[] = [
+  {
+    id: "extension-debug",
+    name: "EXTENSION_DEBUG",
+    key: "EXTENSION_DEBUG",
+    value: "true",
+    hotkey: "Alt+1",
+    updatedAt: 0
+  },
+  {
+    id: "debug-one",
+    name: "debug=1",
+    key: "debug",
+    value: "1",
+    hotkey: "Alt+2",
+    updatedAt: 0
+  }
+];
 
 export async function getGlobalConfig(): Promise<GlobalConfig> {
   const result = await browser.storage.local.get(GLOBAL_CONFIG_KEY);
@@ -93,4 +131,35 @@ export async function setJsonHistory(entries: JsonHistoryEntry[]) {
   await browser.storage.local.set({
     [JSON_HISTORY_KEY]: entries
   });
+}
+
+export async function getUrlParamShortcuts(): Promise<UrlParamShortcut[]> {
+  const result = await browser.storage.local.get(URL_PARAM_SHORTCUTS_KEY);
+  const shortcuts = result[URL_PARAM_SHORTCUTS_KEY] as UrlParamShortcut[] | undefined;
+
+  return Array.isArray(shortcuts) ? shortcuts : DEFAULT_URL_PARAM_SHORTCUTS;
+}
+
+export async function setUrlParamShortcuts(shortcuts: UrlParamShortcut[]) {
+  await browser.storage.local.set({
+    [URL_PARAM_SHORTCUTS_KEY]: shortcuts
+  });
+}
+
+export async function setPendingJsonInput(input: PendingJsonInput) {
+  await browser.storage.local.set({
+    [PENDING_JSON_INPUT_KEY]: input
+  });
+}
+
+export async function consumePendingJsonInput(id: string): Promise<PendingJsonInput | null> {
+  const result = await browser.storage.local.get(PENDING_JSON_INPUT_KEY);
+  const input = result[PENDING_JSON_INPUT_KEY] as PendingJsonInput | undefined;
+
+  if (!input || input.id !== id) {
+    return null;
+  }
+
+  await browser.storage.local.remove(PENDING_JSON_INPUT_KEY);
+  return input;
 }

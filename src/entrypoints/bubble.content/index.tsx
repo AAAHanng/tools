@@ -10,31 +10,43 @@ import {
   DEFAULT_HOST_CONFIG,
   DEFAULT_GLOBAL_CONFIG,
   type HostConfig,
-  type GlobalConfig
+  type GlobalConfig,
+  type UrlParamShortcut
 } from "@/shared/storage";
 import {
+  getUrlParamShortcuts,
   getGlobalConfig,
   getHostConfig,
   setHostConfig
 } from "@/shared/storage";
+import { normalizeHotkeyFromKeyboardEvent } from "@/shared/hotkeys";
 
 type BubbleState = {
   globalConfig: GlobalConfig;
   hostConfig: HostConfig;
+  urlParamShortcuts: UrlParamShortcut[];
 };
+
+const BUBBLE_SIZE = 52;
+const BUBBLE_MARGIN = 12;
+const DRAG_THRESHOLD = 4;
 
 function BubbleApp() {
   const [state, setState] = React.useState<BubbleState>({
     globalConfig: DEFAULT_GLOBAL_CONFIG,
-    hostConfig: DEFAULT_HOST_CONFIG
+    hostConfig: DEFAULT_HOST_CONFIG,
+    urlParamShortcuts: []
   });
   const hostname = window.location.hostname;
+  const positionRef = React.useRef(DEFAULT_HOST_CONFIG.bubblePosition);
+  const suppressNextClickRef = React.useRef(false);
   const dragRef = React.useRef<{
     pointerId: number;
     startX: number;
     startY: number;
     originX: number;
     originY: number;
+    moved: boolean;
   } | null>(null);
 
   React.useEffect(() => {
@@ -45,9 +57,11 @@ function BubbleApp() {
         getGlobalConfig(),
         getHostConfig(hostname)
       ]);
+      const urlParamShortcuts = await getUrlParamShortcuts();
 
       if (mounted) {
-        setState({ globalConfig, hostConfig });
+        setState({ globalConfig, hostConfig, urlParamShortcuts });
+        positionRef.current = hostConfig.bubblePosition;
       }
     };
 
@@ -56,7 +70,7 @@ function BubbleApp() {
         return;
       }
 
-      if (changes.globalConfig || changes.hostConfigs) {
+      if (changes.globalConfig || changes.hostConfigs || changes.urlParamShortcuts) {
         void sync();
       }
     };
@@ -69,6 +83,43 @@ function BubbleApp() {
       browser.storage.onChanged.removeListener(onChanged);
     };
   }, [hostname]);
+
+  React.useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!state.globalConfig.enabled) {
+        return;
+      }
+
+      const hotkey = normalizeHotkeyFromKeyboardEvent(event);
+
+      if (!hotkey) {
+        return;
+      }
+
+      const shortcut = state.urlParamShortcuts.find(
+        (item) => item.hotkey === hotkey && item.key.trim()
+      );
+
+      if (!shortcut) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      void browser.runtime.sendMessage({
+        type: "apply-url-param-shortcut",
+        key: shortcut.key,
+        value: shortcut.value
+      });
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [state.globalConfig.enabled, state.urlParamShortcuts]);
 
   if (!state.globalConfig.enabled || state.hostConfig.mode === "off") {
     return null;
@@ -86,7 +137,8 @@ function BubbleApp() {
       startX: event.clientX,
       startY: event.clientY,
       originX: rect.left,
-      originY: rect.top
+      originY: rect.top,
+      moved: false
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
@@ -96,32 +148,68 @@ function BubbleApp() {
       return;
     }
 
-    const nextX = Math.max(12, Math.min(window.innerWidth - 64, dragRef.current.originX + event.clientX - dragRef.current.startX));
-    const nextY = Math.max(12, Math.min(window.innerHeight - 64, dragRef.current.originY + event.clientY - dragRef.current.startY));
+    const deltaX = event.clientX - dragRef.current.startX;
+    const deltaY = event.clientY - dragRef.current.startY;
+    const nextX = Math.max(
+      BUBBLE_MARGIN,
+      Math.min(
+        window.innerWidth - BUBBLE_SIZE - BUBBLE_MARGIN,
+        dragRef.current.originX + deltaX
+      )
+    );
+    const nextY = Math.max(
+      BUBBLE_MARGIN,
+      Math.min(
+        window.innerHeight - BUBBLE_SIZE - BUBBLE_MARGIN,
+        dragRef.current.originY + deltaY
+      )
+    );
+    const nextPosition = { x: nextX, y: nextY };
+
+    if (Math.hypot(deltaX, deltaY) > DRAG_THRESHOLD) {
+      dragRef.current.moved = true;
+    }
+
+    positionRef.current = nextPosition;
 
     setState((current) => ({
       ...current,
       hostConfig: {
         ...current.hostConfig,
-        bubblePosition: { x: nextX, y: nextY }
+        bubblePosition: nextPosition
       }
     }));
   };
 
   const onPointerUp = async (event: React.PointerEvent<HTMLButtonElement>) => {
-    if (!dragRef.current || dragRef.current.pointerId !== event.pointerId) {
+    const dragState = dragRef.current;
+
+    if (!dragState || dragState.pointerId !== event.pointerId) {
       return;
     }
 
     event.currentTarget.releasePointerCapture(event.pointerId);
     dragRef.current = null;
-    await setHostConfig(hostname, state.hostConfig);
+
+    if (!dragState.moved) {
+      return;
+    }
+
+    suppressNextClickRef.current = true;
+    await setHostConfig(hostname, {
+      ...state.hostConfig,
+      bubblePosition: positionRef.current
+    });
   };
 
   const openToolbox = async () => {
+    if (suppressNextClickRef.current) {
+      suppressNextClickRef.current = false;
+      return;
+    }
+
     await browser.runtime.sendMessage({
       type: "open-toolbox",
-      sourceTabId: undefined,
       sourceHost: hostname
     });
   };
@@ -130,13 +218,15 @@ function BubbleApp() {
     <button
       className="bubble-root"
       style={positionStyle}
-      title="Open Browser Toolbox"
+      title="一键打开工具箱"
+      aria-label="一键打开工具箱"
       onClick={openToolbox}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
     >
       <Wrench size={20} strokeWidth={2.2} />
+      <span>打开</span>
     </button>
   );
 }

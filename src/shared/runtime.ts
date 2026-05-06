@@ -6,6 +6,7 @@ type OpenToolboxOptions = {
   sourceTabId?: number;
   sourceHost?: string;
   toolId?: string;
+  inputId?: string;
 };
 
 export async function getActiveTabContext() {
@@ -31,6 +32,9 @@ export async function openOrFocusToolboxPage(options: OpenToolboxOptions = {}) {
   }
   if (options.toolId) {
     params.set("tool", options.toolId);
+  }
+  if (options.inputId) {
+    params.set("inputId", options.inputId);
   }
 
   const toolboxUrl = browser.runtime.getURL(`${TOOLBOX_ROUTE}${params.toString() ? `?${params.toString()}` : ""}`);
@@ -66,4 +70,3 @@ export async function updateTabUrlParameter(tabId: number, key: string, value: s
     url: nextUrl.toString()
   };
 }
-
