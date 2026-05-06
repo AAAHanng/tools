@@ -35,8 +35,10 @@ const JSON_SAMPLE = `{
   "url": "https://example.com"
 }`;
 
+const JsonFlowViewer = React.lazy(() => import("./json-flow-viewer"));
+
 type ViewMode = "pretty" | "compact";
-type OutputView = "text" | "fold";
+type OutputView = "text" | "fold" | "flow";
 type InputView = "edit" | "fold";
 
 type JsonLintError = {
@@ -1414,7 +1416,7 @@ export function JsonFormatTool() {
     [indent, input, sortKeys, viewMode]
   );
 
-  const outputDepth = outputView === "text" ? 99 : treeDepth;
+  const outputDepth = outputView === "text" || outputView === "flow" ? 99 : treeDepth;
   const treeResetToken = `${treeDepth}-${sortKeys}-${parseRevision}`;
   const outputResetToken = `${outputView}-${outputDepth}-${sortKeys}-${parseRevision}`;
   const editorFontSize = Math.max(12, Math.min(28, Number(fontSize) || 13));
@@ -1751,6 +1753,12 @@ export function JsonFormatTool() {
                 结构
               </button>
               <button
+                className={clsx("mini-switch", outputView === "flow" && "is-active")}
+                onClick={() => setOutputView("flow")}
+              >
+                拖拽
+              </button>
+              <button
                 className={clsx("mini-switch", outputView === "fold" && "is-active")}
                 onClick={toggleExpandAll}
               >
@@ -1778,6 +1786,17 @@ export function JsonFormatTool() {
                     }}
                   />
                 </div>
+              ) : outputView === "flow" ? (
+                <React.Suspense
+                  fallback={
+                    <div className="json-loading-state output-content">
+                      <span className="spinner" />
+                      <span>正在加载拖拽视图...</span>
+                    </div>
+                  }
+                >
+                  <JsonFlowViewer value={parsedValue} />
+                </React.Suspense>
               ) : (
                 <div className="output-content">
                   <JsonViewer

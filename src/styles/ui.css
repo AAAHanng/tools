@@ -1042,6 +1042,88 @@ button {
   color: var(--accent-strong);
 }
 
+.json-flow-shell {
+  position: relative;
+  width: 100%;
+  height: 520px;
+  background: #ffffff;
+}
+
+.json-flow-shell .react-flow__pane {
+  cursor: grab;
+}
+
+.json-flow-shell .react-flow__node {
+  font-family: "SFMono-Regular", "JetBrains Mono", "Menlo", monospace;
+}
+
+.json-flow-node {
+  position: relative;
+  width: 210px;
+  min-height: 74px;
+  padding: 10px 12px;
+  border: 1px solid #cfd8e6;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+}
+
+.json-flow-node-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.json-flow-node-head strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #8b1fa9;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.json-flow-node-head span {
+  flex: none;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.json-flow-node-preview {
+  color: #0f172a;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.json-flow-node-count {
+  margin-top: 6px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.json-flow-handle {
+  width: 9px;
+  height: 9px;
+  border: 2px solid #ffffff;
+  background: var(--accent);
+}
+
+.json-flow-limit {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 4;
+  padding: 6px 10px;
+  border: 1px solid #fed7aa;
+  border-radius: 6px;
+  background: #fff7ed;
+  color: #9a3412;
+  font-size: 12px;
+}
+
 .json-arrow,
 .json-arrow-spacer {
   width: 18px;
@@ -1397,6 +1479,10 @@ button {
 
   .tree-panel {
     min-height: 360px;
+  }
+
+  .json-flow-shell {
+    height: 360px;
   }
 
   .tool-layout-with-history {
