@@ -6,7 +6,7 @@ import {
   indentOnInput,
   syntaxHighlighting
 } from "@codemirror/language";
-import { EditorState } from "@codemirror/state";
+import { EditorState, RangeSetBuilder } from "@codemirror/state";
 import {
   Decoration,
   drawSelection,
@@ -20,9 +20,10 @@ import {
 } from "@codemirror/view";
 import CodeMirror from "@uiw/react-codemirror";
 import clsx from "clsx";
-import { ChevronDown, ChevronRight, GripVertical } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, GripVertical, Trash2 } from "lucide-react";
 import React from "react";
 import { tags as t } from "@lezer/highlight";
+import { getJsonHistory, setJsonHistory, type JsonHistoryEntry } from "@/shared/storage";
 
 const JSON_SAMPLE = `{
   "hello": "world",
@@ -36,6 +37,7 @@ const JSON_SAMPLE = `{
 
 type ViewMode = "pretty" | "compact";
 type OutputView = "text" | "fold";
+type InputView = "edit" | "fold";
 
 type JsonLintError = {
   summary: string;
@@ -55,12 +57,9 @@ type JsonViewerProps = {
   defaultExpandDepth: number;
   resetToken: string;
   childBatchSize?: number;
-};
-
-type HighlightedJsonTextProps = {
-  text: string;
-  clickableLinks?: boolean;
-  lightweight?: boolean;
+  showLineNumbers?: boolean;
+  editable?: boolean;
+  onChange?: (nextValue: unknown) => void;
 };
 
 type JsonNodeProps = {
@@ -72,9 +71,22 @@ type JsonNodeProps = {
   defaultExpandDepth: number;
   resetToken: string;
   childBatchSize?: number;
+  showLineNumbers?: boolean;
+  editable?: boolean;
+  onChange?: (nextValue: unknown) => void;
+};
+
+type JsonLineProps = {
+  depth: number;
+  showLineNumbers?: boolean;
+  className?: string;
+  children: React.ReactNode;
+  actions?: React.ReactNode;
 };
 
 const URL_PATTERN = /https?:\/\/[^\s"]+/gi;
+const URL_EDITOR_PATTERN = /https?:\/\/[^\s",}]+/g;
+const JSON_STRING_PATTERN = /"(?:\\.|[^"\\])*"/g;
 const JSON_TOKEN_PATTERN =
   /"(?:\\.|[^"\\])*"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[{}\[\],:]/g;
 const LARGE_TEXT_THRESHOLD = 120_000;
@@ -82,6 +94,8 @@ const HUGE_TEXT_THRESHOLD = 400_000;
 const LARGE_LINE_THRESHOLD = 3_000;
 const HUGE_LINE_THRESHOLD = 12_000;
 const TREE_CHILD_BATCH_SIZE = 200;
+const STRINGIFIED_JSON_PREFIX_PATTERN = /^\s*[\[{]/;
+const MAX_JSON_HISTORY_ITEMS = 18;
 
 const jsonHighlightStyle = syntaxHighlighting(
   HighlightStyle.define([
@@ -128,13 +142,262 @@ const jsonEditorTheme = EditorView.theme({
     textDecoration: "underline",
     textUnderlineOffset: "2px",
     cursor: "pointer"
+  },
+  ".cm-nested-json-key": {
+    color: "#8b1fa9"
+  },
+  ".cm-nested-json-string": {
+    color: "#0f9d58"
+  },
+  ".cm-nested-json-number": {
+    color: "#2563eb"
+  },
+  ".cm-nested-json-boolean": {
+    color: "#b45309"
+  },
+  ".cm-nested-json-null": {
+    color: "#94a3b8"
+  },
+  ".cm-nested-json-punctuation": {
+    color: "#64748b"
   }
 });
 
 const urlDecorator = new MatchDecorator({
-  regexp: /https?:\/\/[^\s",}]+/g,
+  regexp: URL_EDITOR_PATTERN,
   decoration: () => Decoration.mark({ class: "cm-link-mark" })
 });
+
+type JsonTokenKind =
+  | "key"
+  | "string"
+  | "number"
+  | "boolean"
+  | "null"
+  | "punctuation";
+
+type StringifiedJsonDescriptor = {
+  value: Record<string, unknown> | unknown[];
+  kind: "object" | "array";
+  count: number;
+};
+
+function getNestedTokenColor(kind: JsonTokenKind) {
+  switch (kind) {
+    case "key":
+      return "#8b1fa9";
+    case "string":
+      return "#0f9d58";
+    case "number":
+      return "#2563eb";
+    case "boolean":
+      return "#b45309";
+    case "null":
+      return "#94a3b8";
+    default:
+      return "#64748b";
+  }
+}
+
+const nestedTokenDecorations = {
+  key: Decoration.mark({
+    attributes: {
+      class: "cm-nested-json-key",
+      style: `color: ${getNestedTokenColor("key")};`
+    }
+  }),
+  string: Decoration.mark({
+    attributes: {
+      class: "cm-nested-json-string",
+      style: `color: ${getNestedTokenColor("string")};`
+    }
+  }),
+  number: Decoration.mark({
+    attributes: {
+      class: "cm-nested-json-number",
+      style: `color: ${getNestedTokenColor("number")};`
+    }
+  }),
+  boolean: Decoration.mark({
+    attributes: {
+      class: "cm-nested-json-boolean",
+      style: `color: ${getNestedTokenColor("boolean")};`
+    }
+  }),
+  null: Decoration.mark({
+    attributes: {
+      class: "cm-nested-json-null",
+      style: `color: ${getNestedTokenColor("null")};`
+    }
+  }),
+  punctuation: Decoration.mark({
+    attributes: {
+      class: "cm-nested-json-punctuation",
+      style: `color: ${getNestedTokenColor("punctuation")};`
+    }
+  })
+} as const;
+
+function getTokenKind(
+  token: string,
+  source: string,
+  tokenEnd: number
+): JsonTokenKind {
+  if (token[0] === '"') {
+    return /^\s*:/.test(source.slice(tokenEnd)) ? "key" : "string";
+  }
+
+  if (token === "true" || token === "false") {
+    return "boolean";
+  }
+
+  if (token === "null") {
+    return "null";
+  }
+
+  if (/^-?\d/.test(token)) {
+    return "number";
+  }
+
+  return "punctuation";
+}
+
+function resolveStringifiedJson(text: string): StringifiedJsonDescriptor | null {
+  if (
+    !text ||
+    text.length > LARGE_TEXT_THRESHOLD ||
+    !STRINGIFIED_JSON_PREFIX_PATTERN.test(text)
+  ) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+
+    if (Array.isArray(parsed)) {
+      return {
+        value: parsed,
+        kind: "array",
+        count: parsed.length
+      };
+    }
+
+    if (typeof parsed === "object" && parsed !== null) {
+      return {
+        value: parsed as Record<string, unknown>,
+        kind: "object",
+        count: Object.keys(parsed).length
+      };
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function buildEscapedOffsetMap(rawContent: string) {
+  const offsets = [0];
+  let cursor = 0;
+
+  while (cursor < rawContent.length) {
+    const current = rawContent[cursor];
+
+    if (current !== "\\") {
+      cursor += 1;
+      offsets.push(cursor);
+      continue;
+    }
+
+    const next = rawContent[cursor + 1];
+
+    if (!next) {
+      return null;
+    }
+
+    if (next === "u") {
+      const unicodeBody = rawContent.slice(cursor + 2, cursor + 6);
+
+      if (!/^[0-9a-fA-F]{4}$/.test(unicodeBody)) {
+        return null;
+      }
+
+      cursor += 6;
+      offsets.push(cursor);
+      continue;
+    }
+
+    if (`"\\/bfnrt`.includes(next)) {
+      cursor += 2;
+      offsets.push(cursor);
+      continue;
+    }
+
+    return null;
+  }
+
+  return offsets;
+}
+
+function buildNestedJsonDecorations(text: string, offsetBase: number) {
+  const ranges: Array<{
+    from: number;
+    to: number;
+    kind: JsonTokenKind;
+  }> = [];
+  let outerMatch: RegExpExecArray | null;
+
+  JSON_STRING_PATTERN.lastIndex = 0;
+
+  while ((outerMatch = JSON_STRING_PATTERN.exec(text)) !== null) {
+    const rawStringToken = outerMatch[0];
+    let decodedString: string;
+
+    try {
+      const parsedToken = JSON.parse(rawStringToken);
+
+      if (typeof parsedToken !== "string") {
+        continue;
+      }
+
+      decodedString = parsedToken;
+    } catch {
+      continue;
+    }
+
+    const nestedJson = resolveStringifiedJson(decodedString);
+
+    if (!nestedJson) {
+      continue;
+    }
+
+    const offsetMap = buildEscapedOffsetMap(rawStringToken.slice(1, -1));
+
+    if (!offsetMap) {
+      continue;
+    }
+
+    let innerMatch: RegExpExecArray | null;
+
+    JSON_TOKEN_PATTERN.lastIndex = 0;
+
+    while ((innerMatch = JSON_TOKEN_PATTERN.exec(decodedString)) !== null) {
+      const token = innerMatch[0];
+      const tokenStart = innerMatch.index;
+      const tokenEnd = tokenStart + token.length;
+      const from = offsetBase + outerMatch.index + 1 + offsetMap[tokenStart];
+      const to = offsetBase + outerMatch.index + 1 + offsetMap[tokenEnd];
+
+      ranges.push({
+        from,
+        to,
+        kind: getTokenKind(token, decodedString, tokenEnd)
+      });
+    }
+  }
+
+  return ranges;
+}
 
 const linkDecoratorExtension = ViewPlugin.fromClass(
   class {
@@ -161,15 +424,73 @@ const linkDecoratorExtension = ViewPlugin.fromClass(
 
         const position = view.posAtDOM(target);
         const line = view.state.doc.lineAt(position);
-        const text = line.text;
-        const match = text.match(/https?:\/\/[^\s",}]+/);
+        const column = position - line.from;
+        let match: RegExpExecArray | null;
 
-        if (match?.[0]) {
-          window.open(match[0], "_blank", "noopener,noreferrer");
-          event.preventDefault();
+        URL_EDITOR_PATTERN.lastIndex = 0;
+
+        while ((match = URL_EDITOR_PATTERN.exec(line.text)) !== null) {
+          const start = match.index;
+          const end = start + match[0].length;
+
+          if (column >= start && column <= end) {
+            window.open(match[0], "_blank", "noopener,noreferrer");
+            event.preventDefault();
+            return;
+          }
         }
       }
     }
+  }
+);
+
+const nestedJsonDecoratorExtension = ViewPlugin.fromClass(
+  class {
+    decorations;
+
+    constructor(view: EditorView) {
+      this.decorations = this.buildDecorations(view);
+    }
+
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.viewportChanged) {
+        this.decorations = this.buildDecorations(update.view);
+      }
+    }
+
+    buildDecorations(view: EditorView) {
+      const builder = new RangeSetBuilder<Decoration>();
+      const doc = view.state.doc.toString();
+      const shouldScanWholeDocument =
+        doc.length <= LARGE_TEXT_THRESHOLD &&
+        view.state.doc.lines <= LARGE_LINE_THRESHOLD;
+
+      if (shouldScanWholeDocument) {
+        const ranges = buildNestedJsonDecorations(doc, 0);
+
+        for (const range of ranges) {
+          builder.add(range.from, range.to, nestedTokenDecorations[range.kind]);
+        }
+
+        return builder.finish();
+      }
+
+      for (const { from, to } of view.visibleRanges) {
+        const lineFrom = view.state.doc.lineAt(from).from;
+        const lineTo = view.state.doc.lineAt(Math.max(from, to - 1)).to;
+        const text = view.state.doc.sliceString(lineFrom, lineTo);
+        const ranges = buildNestedJsonDecorations(text, lineFrom);
+
+        for (const range of ranges) {
+          builder.add(range.from, range.to, nestedTokenDecorations[range.kind]);
+        }
+      }
+
+      return builder.finish();
+    }
+  },
+  {
+    decorations: (value) => value.decorations
   }
 );
 
@@ -185,7 +506,8 @@ const baseEditorExtensions = [
   jsonHighlightStyle,
   jsonEditorTheme,
   EditorView.lineWrapping,
-  linkDecoratorExtension
+  linkDecoratorExtension,
+  nestedJsonDecoratorExtension
 ];
 
 function stringifyValue(value: unknown) {
@@ -202,6 +524,42 @@ function stringifyValue(value: unknown) {
   }
 
   return JSON.stringify(value, null, 2);
+}
+
+function toClipboardJsonText(value: unknown) {
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value === null
+  ) {
+    return JSON.stringify(value);
+  }
+
+  return JSON.stringify(value, null, 2);
+}
+
+function getHistoryPreview(text: string) {
+  const trimmed = text.trim();
+
+  if (!trimmed) {
+    return "空内容";
+  }
+
+  const firstLine = trimmed.split("\n")[0] ?? "";
+  return firstLine.length > 38 ? `${firstLine.slice(0, 38)}...` : firstLine;
+}
+
+function formatHistoryTime(timestamp: number) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(timestamp);
 }
 
 function getItemCountText(count: number) {
@@ -250,10 +608,6 @@ function formatBytes(size: number) {
   }
 
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function getLineNumbers(lineCount: number) {
-  return Array.from({ length: Math.max(1, lineCount) }, (_, index) => index + 1).join("\n");
 }
 
 function getLineSnippet(source: string, line: number) {
@@ -357,6 +711,46 @@ function encodeJsonStringContent(text: string) {
 
 function decodeJsonStringContent(text: string) {
   return JSON.parse(`"${text}"`) as string;
+}
+
+function parseEditedPrimitiveValue(rawValue: string, previousValue: unknown) {
+  const trimmed = rawValue.trim();
+
+  if (typeof previousValue === "string") {
+    return rawValue;
+  }
+
+  if (trimmed === "null") {
+    return null;
+  }
+
+  if (trimmed === "true") {
+    return true;
+  }
+
+  if (trimmed === "false") {
+    return false;
+  }
+
+  if (trimmed === "") {
+    throw new Error("值不能为空");
+  }
+
+  if (typeof previousValue === "number") {
+    const parsedNumber = Number(trimmed);
+
+    if (Number.isNaN(parsedNumber)) {
+      throw new Error("请输入合法数字");
+    }
+
+    return parsedNumber;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    throw new Error("请输入合法值，字符串可直接输入，布尔值使用 true/false");
+  }
 }
 
 function parseSimpleJsonPath(path: string) {
@@ -473,107 +867,81 @@ function JsonPrimitive({ value }: { value: unknown }) {
   return <span className="json-null">null</span>;
 }
 
-function HighlightedJsonText(props: HighlightedJsonTextProps) {
-  const { text, clickableLinks = false, lightweight = false } = props;
-  const content = React.useMemo(() => {
-    if (lightweight) {
-      return text || " ";
-    }
-
-    const tokens: React.ReactNode[] = [];
-    let cursor = 0;
-    let match: RegExpExecArray | null;
-
-    JSON_TOKEN_PATTERN.lastIndex = 0;
-
-    while ((match = JSON_TOKEN_PATTERN.exec(text)) !== null) {
-      const [raw] = match;
-      const start = match.index;
-      const end = start + raw.length;
-
-      if (start > cursor) {
-        tokens.push(text.slice(cursor, start));
-      }
-
-      if (raw[0] === '"') {
-        const isKey = /^\s*:/.test(text.slice(end));
-        if (isKey) {
-          tokens.push(
-            <span key={`${start}-key`} className="json-key">
-              {raw}
-            </span>
-          );
-        } else if (clickableLinks) {
-          const inner = raw.slice(1, -1);
-          const { segments, matches } = getStringSegments(inner);
-          tokens.push(
-            <span key={`${start}-string`} className="json-string">
-              "
-              {segments.map((segment, index) => (
-                <React.Fragment key={`${start}-${index}`}>
-                  {segment}
-                  {matches[index] ? (
-                    <a
-                      className="json-link"
-                      href={matches[index]}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {matches[index]}
-                    </a>
-                  ) : null}
-                </React.Fragment>
-              ))}
-              "
-            </span>
-          );
-        } else {
-          tokens.push(
-            <span key={`${start}-string`} className="json-string">
-              {raw}
-            </span>
-          );
-        }
-      } else if (raw === "true" || raw === "false") {
-        tokens.push(
-          <span key={`${start}-boolean`} className="json-boolean">
-            {raw}
-          </span>
-        );
-      } else if (raw === "null") {
-        tokens.push(
-          <span key={`${start}-null`} className="json-null">
-            {raw}
-          </span>
-        );
-      } else if (/^-?\d/.test(raw)) {
-        tokens.push(
-          <span key={`${start}-number`} className="json-number">
-            {raw}
-          </span>
-        );
-      } else {
-        tokens.push(
-          <span key={`${start}-punctuation`} className="json-punctuation">
-            {raw}
-          </span>
-        );
-      }
-
-      cursor = end;
-    }
-
-    if (cursor < text.length) {
-      tokens.push(text.slice(cursor));
-    }
-
-    return tokens.length ? tokens : " ";
-  }, [clickableLinks, lightweight, text]);
+function JsonLine(props: JsonLineProps) {
+  const { depth, showLineNumbers = true, className, children, actions } = props;
 
   return (
-    <pre className={clsx("json-text-view", lightweight && "is-lightweight")}>
-      {content}
-    </pre>
+    <div className={clsx("json-line", className, showLineNumbers && "has-line-number")}>
+      {showLineNumbers ? <span className="json-line-number" aria-hidden="true" /> : null}
+      <div
+        className="json-line-content"
+        style={{ paddingLeft: 10 + depth * 18 }}
+      >
+        <div className="json-line-body">{children}</div>
+        {actions ? <div className="json-line-actions">{actions}</div> : null}
+      </div>
+    </div>
+  );
+}
+
+function EditableJsonPrimitive(props: {
+  value: unknown;
+  onCommit: (nextValue: unknown) => void;
+}) {
+  const { value, onCommit } = props;
+  const [editing, setEditing] = React.useState(false);
+  const [draft, setDraft] = React.useState("");
+
+  React.useEffect(() => {
+    if (!editing) {
+      setDraft(typeof value === "string" ? value : String(value));
+    }
+  }, [editing, value]);
+
+  const commit = () => {
+    try {
+      onCommit(parseEditedPrimitiveValue(draft, value));
+      setEditing(false);
+    } catch {
+      return;
+    }
+  };
+
+  if (!editing) {
+    return (
+      <button
+        className="json-inline-edit-trigger"
+        onClick={() => {
+          setDraft(typeof value === "string" ? value : String(value));
+          setEditing(true);
+        }}
+        type="button"
+      >
+        <JsonPrimitive value={value} />
+      </button>
+    );
+  }
+
+  return (
+    <span className="json-inline-edit">
+      <input
+        className="json-inline-input"
+        autoFocus
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            commit();
+          }
+
+          if (event.key === "Escape") {
+            setEditing(false);
+            setDraft(typeof value === "string" ? value : String(value));
+          }
+        }}
+      />
+    </span>
   );
 }
 
@@ -586,14 +954,23 @@ function JsonNode(props: JsonNodeProps) {
     isLast,
     defaultExpandDepth,
     resetToken,
-    childBatchSize
+    childBatchSize,
+    showLineNumbers = true,
+    editable = false,
+    onChange
   } = props;
-  const isArray = Array.isArray(value);
-  const isObject = typeof value === "object" && value !== null && !isArray;
+  const nestedJson = React.useMemo(
+    () => (typeof value === "string" ? resolveStringifiedJson(value) : null),
+    [value]
+  );
+  const resolvedValue = nestedJson?.value ?? value;
+  const isArray = Array.isArray(resolvedValue);
+  const isObject =
+    typeof resolvedValue === "object" && resolvedValue !== null && !isArray;
   const entries = isArray
-    ? (value as unknown[]).map((item, index) => [String(index), item] as const)
+    ? (resolvedValue as unknown[]).map((item, index) => [String(index), item] as const)
     : isObject
-      ? Object.entries(value as Record<string, unknown>)
+      ? Object.entries(resolvedValue as Record<string, unknown>)
       : [];
   const isExpandable = isArray || isObject;
   const [open, setOpen] = React.useState(depth < defaultExpandDepth);
@@ -611,13 +988,28 @@ function JsonNode(props: JsonNodeProps) {
     setVisibleCount(Math.min(entries.length, batchSize));
   }, [batchSize, entries.length, resetToken]);
 
-  const paddingLeft = depth * 18;
   const visibleEntries = entries.slice(0, visibleCount);
   const hiddenCount = Math.max(0, entries.length - visibleCount);
+  const copyValue = nestedJson ? resolvedValue : value;
+  const lineActions = (
+    <button
+      className="json-node-action"
+      onClick={() => navigator.clipboard.writeText(toClipboardJsonText(copyValue))}
+      type="button"
+      title="复制当前层"
+    >
+      <Copy size={13} />
+      <span>复制当前层</span>
+    </button>
+  );
 
   if (!isExpandable) {
     return (
-      <div className="json-line" style={{ paddingLeft }}>
+      <JsonLine
+        depth={depth}
+        showLineNumbers={showLineNumbers}
+        actions={lineActions}
+      >
         <span className="json-arrow-spacer" />
         {label !== undefined ? (
           <>
@@ -629,17 +1021,29 @@ function JsonNode(props: JsonNodeProps) {
             <span className="json-punctuation">: </span>
           </>
         ) : null}
-        <JsonPrimitive value={value} />
+        {editable && onChange ? (
+          <EditableJsonPrimitive value={value} onCommit={onChange} />
+        ) : (
+          <JsonPrimitive value={value} />
+        )}
         {!isLast ? <span className="json-punctuation">,</span> : null}
-      </div>
+      </JsonLine>
     );
   }
 
-  const itemLabel = isArray ? "array" : "object";
+  const itemLabel = nestedJson
+    ? `stringified ${nestedJson.kind}`
+    : isArray
+      ? "array"
+      : "object";
 
   return (
     <div className="json-block">
-      <div className="json-line" style={{ paddingLeft }}>
+      <JsonLine
+        depth={depth}
+        showLineNumbers={showLineNumbers}
+        actions={lineActions}
+      >
         <button
           className="json-arrow"
           onClick={() => setOpen((current) => !current)}
@@ -657,6 +1061,9 @@ function JsonNode(props: JsonNodeProps) {
             <span className="json-punctuation">: </span>
           </>
         ) : null}
+        {nestedJson ? (
+          <span className="json-stringified-chip">{itemLabel}</span>
+        ) : null}
         <span className="json-punctuation">{isArray ? "[" : "{"}</span>
         {!open ? (
           <>
@@ -668,7 +1075,7 @@ function JsonNode(props: JsonNodeProps) {
             {!isLast ? <span className="json-punctuation">,</span> : null}
           </>
         ) : null}
-      </div>
+      </JsonLine>
 
       {open ? (
         <>
@@ -684,12 +1091,45 @@ function JsonNode(props: JsonNodeProps) {
                 defaultExpandDepth={defaultExpandDepth}
                 resetToken={resetToken}
                 childBatchSize={childBatchSize}
+                showLineNumbers={showLineNumbers}
+                editable={editable}
+                onChange={
+                  editable
+                    ? (nextChildValue) => {
+                        if (!onChange) {
+                          return;
+                        }
+
+                        const wrapNextValue = (nextResolvedValue: unknown) => {
+                          if (nestedJson) {
+                            onChange(JSON.stringify(nextResolvedValue));
+                            return;
+                          }
+
+                          onChange(nextResolvedValue);
+                        };
+
+                        if (isArray) {
+                          const nextArray = [...(resolvedValue as unknown[])];
+                          nextArray[Number(entryLabel)] = nextChildValue;
+                          wrapNextValue(nextArray);
+                          return;
+                        }
+
+                        wrapNextValue({
+                          ...(resolvedValue as Record<string, unknown>),
+                          [entryLabel]: nextChildValue
+                        });
+                      }
+                    : undefined
+                }
               />
             ))}
             {hiddenCount > 0 ? (
-              <div
-                className="json-line json-more-row"
-                style={{ paddingLeft: (depth + 1) * 18 }}
+              <JsonLine
+                depth={depth + 1}
+                showLineNumbers={showLineNumbers}
+                className="json-more-row"
               >
                 <span className="json-arrow-spacer" />
                 <button
@@ -703,14 +1143,14 @@ function JsonNode(props: JsonNodeProps) {
                   显示更多 {Math.min(batchSize, hiddenCount)} 项
                 </button>
                 <span className="json-collapsed-meta">剩余 {hiddenCount} 项</span>
-              </div>
+              </JsonLine>
             ) : null}
           </div>
-          <div className="json-line" style={{ paddingLeft }}>
+          <JsonLine depth={depth} showLineNumbers={showLineNumbers}>
             <span className="json-arrow-spacer" />
             <span className="json-punctuation">{isArray ? "]" : "}"}</span>
             {!isLast ? <span className="json-punctuation">,</span> : null}
-          </div>
+          </JsonLine>
         </>
       ) : null}
     </div>
@@ -718,10 +1158,18 @@ function JsonNode(props: JsonNodeProps) {
 }
 
 function JsonViewer(props: JsonViewerProps) {
-  const { value, defaultExpandDepth, resetToken, childBatchSize } = props;
+  const {
+    value,
+    defaultExpandDepth,
+    resetToken,
+    childBatchSize,
+    showLineNumbers = true,
+    editable = false,
+    onChange
+  } = props;
 
   return (
-    <div className="json-viewer">
+    <div className={clsx("json-viewer", showLineNumbers && "has-line-numbers")}>
       <JsonNode
         value={value}
         depth={0}
@@ -729,6 +1177,9 @@ function JsonViewer(props: JsonViewerProps) {
         defaultExpandDepth={defaultExpandDepth}
         resetToken={resetToken}
         childBatchSize={childBatchSize}
+        showLineNumbers={showLineNumbers}
+        editable={editable}
+        onChange={onChange}
       />
     </div>
   );
@@ -741,11 +1192,13 @@ export function JsonFormatTool() {
   const [fontSize, setFontSize] = React.useState("13");
   const [sortKeys, setSortKeys] = React.useState(false);
   const [viewMode, setViewMode] = React.useState<ViewMode>("pretty");
-  const [outputView, setOutputView] = React.useState<OutputView>("text");
+  const [inputView, setInputView] = React.useState<InputView>("edit");
+  const [outputView, setOutputView] = React.useState<OutputView>("fold");
   const [showMoreTools, setShowMoreTools] = React.useState(false);
   const [isProcessing, setIsProcessing] = React.useState(false);
   const [cursorMetrics, setCursorMetrics] = React.useState({ line: 1, column: 1 });
   const [parseRevision, setParseRevision] = React.useState(0);
+  const [historyEntries, setHistoryEntries] = React.useState<JsonHistoryEntry[]>([]);
   const [pathQuery, setPathQuery] = React.useState("");
   const [pathResult, setPathResult] = React.useState<PathQueryResult>({
     state: "idle",
@@ -779,6 +1232,39 @@ export function JsonFormatTool() {
   const parseDelay = isHugeDocument ? 180 : isLargeDocument ? 80 : 0;
 
   React.useEffect(() => {
+    void getJsonHistory().then((entries) => {
+      setHistoryEntries(entries);
+    });
+  }, []);
+
+  const saveHistoryEntries = React.useCallback((updater: (current: JsonHistoryEntry[]) => JsonHistoryEntry[]) => {
+    setHistoryEntries((current) => {
+      const next = updater(current);
+      void setJsonHistory(next);
+      return next;
+    });
+  }, []);
+
+  const keepCurrentHistoryEntry = React.useCallback((content: string) => {
+    const trimmed = content.trim();
+
+    if (!trimmed) {
+      return;
+    }
+
+    saveHistoryEntries((current) => {
+      const deduped = current.filter((entry) => entry.content !== trimmed);
+      const nextEntry: JsonHistoryEntry = {
+        id: crypto.randomUUID(),
+        content: trimmed,
+        updatedAt: Date.now()
+      };
+
+      return [nextEntry, ...deduped].slice(0, MAX_JSON_HISTORY_ITEMS);
+    });
+  }, [saveHistoryEntries]);
+
+  React.useEffect(() => {
     let cancelled = false;
     const scheduleId = window.setTimeout(() => {
       try {
@@ -791,7 +1277,8 @@ export function JsonFormatTool() {
         }
 
         setParsedValue(normalized);
-        setOutputText(JSON.stringify(normalized, null, space));
+        const nextOutput = JSON.stringify(normalized, null, space);
+        setOutputText(nextOutput);
         setError(null);
         setParseRevision((current) => current + 1);
       } catch (formatError) {
@@ -909,8 +1396,27 @@ export function JsonFormatTool() {
     }
   };
 
+  const applyStructuredOutputChange = React.useCallback(
+    (nextValue: unknown) => {
+      try {
+        const normalized = sortKeys ? sortJsonValue(nextValue) : nextValue;
+        const space = viewMode === "pretty" ? Number(indent) || 2 : 0;
+        setParsedValue(normalized);
+        const nextOutput = JSON.stringify(normalized, null, space);
+        setOutputText(nextOutput);
+        setInput(nextOutput);
+        setError(null);
+        setParseRevision((current) => current + 1);
+      } catch (changeError) {
+        setError(buildJsonLintError(input, changeError));
+      }
+    },
+    [indent, input, sortKeys, viewMode]
+  );
+
   const outputDepth = outputView === "text" ? 99 : treeDepth;
-  const resetToken = `${outputView}-${outputDepth}-${sortKeys}-${parseRevision}`;
+  const treeResetToken = `${treeDepth}-${sortKeys}-${parseRevision}`;
+  const outputResetToken = `${outputView}-${outputDepth}-${sortKeys}-${parseRevision}`;
   const editorFontSize = Math.max(12, Math.min(28, Number(fontSize) || 13));
   const isAllExpanded = outputView === "fold" && treeDepth >= 99;
   const toggleExpandAll = () => {
@@ -1002,25 +1508,6 @@ export function JsonFormatTool() {
           >
             工具
           </button>
-          <div className="toolbar-spacer" />
-          <button
-            className={clsx("mini-switch", outputView === "text" && "is-active")}
-            onClick={() => setOutputView("text")}
-          >
-            文本
-          </button>
-          <button
-            className={clsx("mini-switch", outputView === "fold" && "is-active")}
-            onClick={() => setOutputView("fold")}
-          >
-            折叠
-          </button>
-          <button
-            className={clsx("mini-switch", outputView === "fold" && "is-active")}
-            onClick={toggleExpandAll}
-          >
-            {isAllExpanded ? "全部折叠" : "全部展开"}
-          </button>
         </div>
       </div>
 
@@ -1090,35 +1577,143 @@ export function JsonFormatTool() {
         </section>
       ) : null}
 
-      <div
-        ref={splitContainerRef}
-        className="resizable-workbench"
-        style={
-          {
-            "--left-pane-width": `${leftPaneWidth}%`
-          } as React.CSSProperties
-        }
-      >
+      <div className="tool-layout-with-history">
+        <aside className="history-sidebar">
+          <div className="history-sidebar-head">
+            <div className="history-sidebar-head-copy">
+              <strong>更新记录</strong>
+              <span>{historyEntries.length} 条</span>
+            </div>
+            <button
+              className="mini-switch"
+              onClick={() => keepCurrentHistoryEntry(outputText)}
+              type="button"
+              disabled={Boolean(error) || !outputText.trim()}
+            >
+              保留当前
+            </button>
+          </div>
+          <div className="history-list">
+            {historyEntries.length ? (
+              historyEntries.map((entry) => (
+                <div key={entry.id} className="history-item">
+                  <button
+                    className="history-item-main"
+                    onClick={() => setInput(entry.content)}
+                    type="button"
+                  >
+                    <span className="history-item-time">
+                      {formatHistoryTime(entry.updatedAt)}
+                    </span>
+                    <strong>{getHistoryPreview(entry.content)}</strong>
+                    <span className="history-item-meta">
+                      {entry.content.length} chars
+                    </span>
+                  </button>
+                  <div className="history-item-actions">
+                    <button
+                      className="mini-switch danger-switch"
+                      onClick={() => {
+                        if (!window.confirm("确认删除这条记录？")) {
+                          return;
+                        }
+
+                        saveHistoryEntries((current) =>
+                          current.filter((item) => item.id !== entry.id)
+                        );
+                      }}
+                      type="button"
+                    >
+                      <Trash2 size={14} />
+                      <span>删除</span>
+                    </button>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="history-empty">点击“保留当前”后会出现在这里</div>
+            )}
+          </div>
+        </aside>
+
+        <div
+          ref={splitContainerRef}
+          className="resizable-workbench"
+          style={
+            {
+              "--left-pane-width": `${leftPaneWidth}%`
+            } as React.CSSProperties
+          }
+        >
         <section className={clsx("editor-panel", error && "is-error-panel")}>
           <div className="editor-panel-head">
-            <strong>输入</strong>
-            <span>
-              行 {cursorMetrics.line} / 列 {cursorMetrics.column} · 共 {inputMetrics.lineCount} 行 · {formatBytes(inputMetrics.charCount)}
-              {shouldUseLightweightInput ? " · 轻量模式" : ""}
-            </span>
+            <div className="editor-panel-head-main">
+              <strong>输入</strong>
+              <span>
+                行 {cursorMetrics.line} / 列 {cursorMetrics.column} · 共 {inputMetrics.lineCount} 行 · {formatBytes(inputMetrics.charCount)}
+                {shouldUseLightweightInput ? " · 轻量模式" : ""}
+              </span>
+            </div>
+            <div className="editor-panel-head-actions">
+              <button
+                className={clsx("mini-switch", inputView === "edit" && "is-active")}
+                onClick={() => setInputView("edit")}
+              >
+                编辑
+              </button>
+              <button
+                className={clsx("mini-switch", inputView === "fold" && "is-active")}
+                onClick={() => setInputView("fold")}
+              >
+                结构
+              </button>
+            </div>
           </div>
-          <div className="code-mirror-shell" style={{ fontSize: editorFontSize }}>
-            <CodeMirror
-              value={input}
-              height="100%"
-              extensions={inputEditorExtensions}
-              onChange={handleInputEditorChange}
-              basicSetup={{
-                foldGutter: true,
-                lineNumbers: true
-              }}
-            />
-          </div>
+          {inputView === "edit" ? (
+            <div className="code-mirror-shell" style={{ fontSize: editorFontSize }}>
+              <CodeMirror
+                value={input}
+                height="100%"
+                extensions={inputEditorExtensions}
+                onChange={handleInputEditorChange}
+                basicSetup={{
+                  foldGutter: true,
+                  lineNumbers: true
+                }}
+              />
+            </div>
+          ) : (
+            <div className="tree-panel" style={{ fontSize: editorFontSize }}>
+              {isProcessing ? (
+                <div className="json-loading-state">
+                  <span className="spinner" />
+                  <span>正在解析大体量 JSON...</span>
+                </div>
+              ) : !error ? (
+                <div className="output-content">
+                  <JsonViewer
+                    value={parsedValue}
+                    defaultExpandDepth={treeDepth}
+                    resetToken={`input-${treeResetToken}`}
+                    childBatchSize={shouldUseLightweightInput ? TREE_CHILD_BATCH_SIZE : undefined}
+                    showLineNumbers
+                  />
+                </div>
+              ) : (
+                <div className="json-error-inline output-content">
+                  <strong>JSONLint</strong>
+                  <span>{error.summary}</span>
+                  {error.line && error.column ? (
+                    <span>
+                      第 {error.line} 行，第 {error.column} 列
+                    </span>
+                  ) : null}
+                  {error.snippet ? <code>{error.snippet}</code> : null}
+                  <span>{error.suggestion}</span>
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
         <div
@@ -1133,13 +1728,35 @@ export function JsonFormatTool() {
 
         <section className={clsx("editor-panel", error && "is-error-panel")}>
           <div className="editor-panel-head">
-            <strong>输出</strong>
-            <span>
-              {isProcessing
-                ? "处理中..."
-                : `共 ${outputMetrics.lineCount} 行 · ${formatBytes(outputMetrics.charCount)}`}
-              {shouldUseLightweightOutput ? " · 轻量模式" : ""}
-            </span>
+            <div className="editor-panel-head-main">
+              <strong>输出</strong>
+              <span>
+                {isProcessing
+                  ? "处理中..."
+                  : `共 ${outputMetrics.lineCount} 行 · ${formatBytes(outputMetrics.charCount)}`}
+                {shouldUseLightweightOutput ? " · 轻量模式" : ""}
+              </span>
+            </div>
+            <div className="editor-panel-head-actions">
+              <button
+                className={clsx("mini-switch", outputView === "text" && "is-active")}
+                onClick={() => setOutputView("text")}
+              >
+                文本
+              </button>
+              <button
+                className={clsx("mini-switch", outputView === "fold" && "is-active")}
+                onClick={() => setOutputView("fold")}
+              >
+                结构
+              </button>
+              <button
+                className={clsx("mini-switch", outputView === "fold" && "is-active")}
+                onClick={toggleExpandAll}
+              >
+                {isAllExpanded ? "全部折叠" : "全部展开"}
+              </button>
+            </div>
           </div>
           <div className="tree-panel" style={{ fontSize: editorFontSize }}>
             {isProcessing ? (
@@ -1166,8 +1783,11 @@ export function JsonFormatTool() {
                   <JsonViewer
                     value={parsedValue}
                     defaultExpandDepth={outputDepth}
-                    resetToken={resetToken}
+                    resetToken={outputResetToken}
                     childBatchSize={shouldUseLightweightOutput ? TREE_CHILD_BATCH_SIZE : undefined}
+                    showLineNumbers
+                    editable
+                    onChange={applyStructuredOutputChange}
                   />
                 </div>
               )
@@ -1186,6 +1806,7 @@ export function JsonFormatTool() {
             )}
           </div>
         </section>
+        </div>
       </div>
     </div>
   );

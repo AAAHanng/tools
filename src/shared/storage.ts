@@ -13,9 +13,8 @@ export type GlobalConfig = {
   theme: "system" | "light" | "dark";
 };
 
-export type JsonToolDraft = {
+export type JsonHistoryEntry = {
   id: string;
-  name: string;
   content: string;
   updatedAt: number;
 };
@@ -24,7 +23,7 @@ type HostConfigMap = Record<string, HostConfig>;
 
 const GLOBAL_CONFIG_KEY = "globalConfig";
 const HOST_CONFIGS_KEY = "hostConfigs";
-const JSON_TOOL_DRAFTS_KEY = "jsonToolDrafts";
+const JSON_HISTORY_KEY = "jsonFormatHistory";
 
 export const DEFAULT_GLOBAL_CONFIG: GlobalConfig = {
   enabled: true,
@@ -85,13 +84,13 @@ export async function pushRecentTool(toolId: string): Promise<GlobalConfig> {
   return nextGlobal;
 }
 
-export async function getJsonToolDrafts(): Promise<JsonToolDraft[]> {
-  const result = await browser.storage.local.get(JSON_TOOL_DRAFTS_KEY);
-  return (result[JSON_TOOL_DRAFTS_KEY] as JsonToolDraft[] | undefined) ?? [];
+export async function getJsonHistory(): Promise<JsonHistoryEntry[]> {
+  const result = await browser.storage.local.get(JSON_HISTORY_KEY);
+  return (result[JSON_HISTORY_KEY] as JsonHistoryEntry[] | undefined) ?? [];
 }
 
-export async function setJsonToolDrafts(drafts: JsonToolDraft[]) {
+export async function setJsonHistory(entries: JsonHistoryEntry[]) {
   await browser.storage.local.set({
-    [JSON_TOOL_DRAFTS_KEY]: drafts
+    [JSON_HISTORY_KEY]: entries
   });
 }

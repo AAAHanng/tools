@@ -458,7 +458,7 @@ button {
 .workbench-toolbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 16px;
   padding: 10px 12px;
   border-radius: 8px;
@@ -521,17 +521,13 @@ button {
 
 .single-line-toolbar {
   align-items: center;
-  flex-wrap: nowrap;
+  justify-content: flex-start;
+  flex-wrap: wrap;
   overflow-x: auto;
 }
 
 .single-line-toolbar .compact-field.small {
   flex: none;
-}
-
-.toolbar-spacer {
-  flex: 1;
-  min-width: 12px;
 }
 
 .segmented-control {
@@ -687,6 +683,12 @@ button {
   border-bottom: 1px solid var(--border);
 }
 
+.editor-panel-head-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
 .editor-panel-head strong {
   font-size: 0.92rem;
 }
@@ -694,6 +696,14 @@ button {
 .editor-panel-head span {
   font-size: 0.82rem;
   color: var(--soft);
+}
+
+.editor-panel-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .workspace-textarea {
@@ -767,6 +777,109 @@ button {
   padding: 12px 14px;
 }
 
+.tool-layout-with-history {
+  display: grid;
+  grid-template-columns: 170px minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+}
+
+.history-sidebar {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 520px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.history-sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 12px;
+  background: var(--panel-muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.history-sidebar-head-copy {
+  display: grid;
+  gap: 2px;
+}
+
+.history-sidebar-head strong {
+  font-size: 0.92rem;
+}
+
+.history-sidebar-head span {
+  font-size: 0.82rem;
+  color: var(--soft);
+}
+
+.history-list {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  overflow: auto;
+  align-content: start;
+}
+
+.history-item {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.history-item-main {
+  display: grid;
+  gap: 4px;
+  padding: 0;
+  text-align: left;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.history-item-main strong {
+  font-size: 0.84rem;
+  color: var(--text);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.history-item-time,
+.history-item-meta,
+.history-empty {
+  font-size: 0.78rem;
+  color: var(--soft);
+}
+
+.history-item-actions {
+  display: grid;
+  gap: 6px;
+}
+
+.history-item-actions .mini-switch {
+  justify-content: center;
+  gap: 6px;
+}
+
+.danger-switch {
+  color: #b91c1c;
+}
+
+.history-empty {
+  padding: 8px 4px;
+  line-height: 1.5;
+}
+
 .resizable-workbench {
   display: grid;
   grid-template-columns: minmax(280px, var(--left-pane-width, 50%)) 12px minmax(
@@ -800,6 +913,10 @@ button {
   color: var(--text);
 }
 
+.json-viewer.has-line-numbers {
+  counter-reset: json-line;
+}
+
 .json-block + .json-block,
 .json-line + .json-block,
 .json-block + .json-line,
@@ -814,6 +931,115 @@ button {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.json-line.has-line-number {
+  align-items: stretch;
+}
+
+.json-line-number {
+  position: relative;
+  width: 42px;
+  min-width: 42px;
+  padding: 0 8px 0 0;
+  border-right: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #94a3b8;
+  text-align: right;
+  user-select: none;
+}
+
+.json-line-number::before {
+  counter-increment: json-line;
+  content: counter(json-line);
+  display: block;
+  padding-top: 1px;
+  line-height: 22px;
+}
+
+.json-line-content {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex: 1;
+  min-width: 0;
+  gap: 10px;
+}
+
+.json-line-body {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+  flex: 1;
+}
+
+.json-line-actions {
+  display: inline-flex;
+  align-items: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.json-line:hover .json-line-actions,
+.json-line:focus-within .json-line-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.json-inline-edit-trigger {
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: text;
+  border-radius: 4px;
+}
+
+.json-inline-edit {
+  display: inline-flex;
+  align-items: center;
+  min-width: 120px;
+}
+
+.json-inline-edit-trigger:hover {
+  background: rgba(37, 99, 235, 0.06);
+}
+
+.json-inline-input {
+  width: min(320px, 100%);
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid #bfd3ff;
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text);
+  font: inherit;
+}
+
+.json-inline-input:focus {
+  outline: none;
+  border-color: #7aa2ff;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+
+.json-node-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 0 8px;
+  border: 1px solid #d7dee7;
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.json-node-action:hover {
+  background: #f8fafc;
+  color: var(--accent-strong);
 }
 
 .json-arrow,
@@ -848,6 +1074,19 @@ button {
 .json-item-label,
 .json-collapsed-meta {
   color: #64748b;
+}
+
+.json-stringified-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #eef4ff;
+  color: #1d4ed8;
+  font-size: 11px;
+  line-height: 1;
 }
 
 .json-punctuation {
@@ -909,7 +1148,7 @@ button {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 8px;
+  left: 60px;
   width: 1px;
   background: #e2e8f0;
 }
@@ -1128,6 +1367,16 @@ button {
     width: 100%;
   }
 
+  .editor-panel-head {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .editor-panel-head-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
   .compact-actions {
     justify-content: start;
   }
@@ -1148,6 +1397,14 @@ button {
 
   .tree-panel {
     min-height: 360px;
+  }
+
+  .tool-layout-with-history {
+    grid-template-columns: 1fr;
+  }
+
+  .history-sidebar {
+    min-height: 220px;
   }
 
   .resizable-workbench {
